@@ -17,6 +17,46 @@ body {
   padding: 16px;
 }
 
+.videoPanel {
+  margin: 0 0 16px;
+  padding: 12px;
+  border: 1px solid rgba(17, 94, 89, 0.12);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.sectionLabel {
+  margin: 0 0 6px;
+  color: #115e59;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.videoTitle {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.videoSource {
+  margin: 6px 0 12px;
+  color: #52606d;
+  font-size: 12px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.videoActions {
+  display: flex;
+  gap: 8px;
+}
+
+.videoActions button {
+  width: 50%;
+}
+
 h1 {
   margin: 0 0 4px;
   font-size: 22px;
@@ -74,6 +114,15 @@ button {
 
 button:hover {
   background: #0f766e;
+}
+
+.secondaryButton {
+  background: #dbe7e6;
+  color: #134e4a;
+}
+
+.secondaryButton:hover {
+  background: #c4d9d6;
 }
 
 .status {

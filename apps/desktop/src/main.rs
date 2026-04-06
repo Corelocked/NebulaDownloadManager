@@ -3,6 +3,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+#[cfg(windows)]
+use std::{ffi::c_void, ptr::null_mut};
 
 use arboard::Clipboard;
 #[cfg(feature = "torrent-rqbit")]
@@ -65,8 +67,20 @@ const BRIGHT_TEXT: egui::Color32 = egui::Color32::from_rgb(244, 246, 250);
 const OUTLINE: egui::Color32 = egui::Color32::from_rgb(66, 71, 83);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(windows)]
+const ERROR_ALREADY_EXISTS: u32 = 183;
 
 fn main() -> eframe::Result<()> {
+    #[cfg(windows)]
+    let _single_instance_guard = match acquire_single_instance_guard() {
+        Ok(Some(guard)) => Some(guard),
+        Ok(None) => return Ok(()),
+        Err(err) => {
+            eprintln!("single-instance guard failed: {err}");
+            None
+        }
+    };
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let launch_request = args.iter().cloned().find_map(parse_launch_request);
     let start_in_background = args.iter().any(|arg| arg == "--background");
@@ -113,6 +127,54 @@ fn load_app_icon() -> Option<IconData> {
 }
 
 #[cfg(windows)]
+struct SingleInstanceGuard(*mut c_void);
+
+#[cfg(windows)]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn acquire_single_instance_guard() -> Result<Option<SingleInstanceGuard>, String> {
+    let mutex_name: Vec<u16> = "Local\\NebulaDM.Desktop.SingleInstance"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe { CreateMutexW(null_mut(), 0, mutex_name.as_ptr()) };
+    if handle.is_null() {
+        return Err(format!(
+            "CreateMutexW failed with error {}",
+            unsafe { GetLastError() }
+        ));
+    }
+
+    let last_error = unsafe { GetLastError() };
+    if last_error == ERROR_ALREADY_EXISTS {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        return Ok(None);
+    }
+
+    Ok(Some(SingleInstanceGuard(handle)))
+}
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn CreateMutexW(
+        lp_mutex_attributes: *mut c_void,
+        b_initial_owner: i32,
+        lp_name: *const u16,
+    ) -> *mut c_void;
+    fn GetLastError() -> u32;
+    fn CloseHandle(handle: *mut c_void) -> i32;
+}
+
+#[cfg(windows)]
 fn load_tray_icon() -> Option<TrayIconImage> {
     let bytes = include_bytes!("../../../assets/nebuladm-logo.png");
     let image = image::load_from_memory(bytes).ok()?.into_rgba8();
@@ -139,6 +201,90 @@ fn resolve_download_root() -> PathBuf {
 
 fn display_path(path: &Path) -> String {
     path.display().to_string()
+}
+
+fn read_only_multiline(ui: &mut egui::Ui, label: &str, value: &str, rows: usize) {
+    ui.label(egui::RichText::new(label).color(MUTED_TEXT));
+    let mut text = value.to_owned();
+    ui.add(
+        egui::TextEdit::multiline(&mut text)
+            .desired_width(f32::INFINITY)
+            .desired_rows(rows)
+            .interactive(false),
+    );
+}
+
+fn truncate_middle(value: &str, max_chars: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
+        return value.to_owned();
+    }
+
+    let keep_each_side = max_chars.saturating_sub(1) / 2;
+    let start: String = value.chars().take(keep_each_side).collect();
+    let end: String = value
+        .chars()
+        .rev()
+        .take(keep_each_side)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{start}...{end}")
+}
+
+fn browser_capture_display_name(payload: &BrowserCapturePayload) -> String {
+    let raw_name = payload.file_name.trim();
+    let looks_noisy = raw_name.len() > 120
+        || raw_name.contains('?')
+        || raw_name.contains('&')
+        || raw_name.contains("filename%3D")
+        || raw_name.contains("response-content");
+    let preferred = if raw_name.is_empty() || looks_noisy {
+        infer_display_name_from_source(&payload.source, payload.kind.clone())
+    } else {
+        raw_name.to_owned()
+    };
+    truncate_middle(&preferred, 90)
+}
+
+fn normalize_browser_capture_file_name(payload: &BrowserCapturePayload) -> String {
+    let raw_name = payload.file_name.trim();
+    let looks_noisy = raw_name.is_empty()
+        || raw_name.len() > 120
+        || raw_name.contains('?')
+        || raw_name.contains('&')
+        || raw_name.contains("filename%3D")
+        || raw_name.contains("response-content");
+
+    let preferred = if looks_noisy {
+        infer_display_name_from_source(&payload.source, payload.kind.clone())
+    } else {
+        raw_name.to_owned()
+    };
+
+    let truncated = truncate_middle(&preferred, 90);
+    let trimmed = truncated.trim_matches(['.', ' ']);
+    if trimmed.is_empty() {
+        "download.bin".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn browser_capture_source_summary(source: &str) -> String {
+    let trimmed = source.trim();
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .or_else(|| trimmed.strip_prefix("ftp://"))
+        .unwrap_or(trimmed);
+    let host_or_prefix = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(trimmed);
+    truncate_middle(host_or_prefix, 60)
 }
 
 fn infer_download_kind(source: &str) -> DownloadKind {
@@ -833,6 +979,9 @@ impl eframe::App for DesktopApp {
                     .inner_margin(egui::Margin::symmetric(14, 12)),
             )
             .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for tab in DownloadTab::ALL {
                         let selected = self.selected_tab == tab;
@@ -1115,6 +1264,7 @@ impl eframe::App for DesktopApp {
                     ui.add_space(10.0);
                 }
                 }
+                });
             });
 
         self.render_browser_capture_confirmation_popup(ctx);
@@ -1318,38 +1468,52 @@ impl DesktopApp {
             .color(MUTED_TEXT),
         );
         ui.add_space(10.0);
+        let display_name = browser_capture_display_name(&payload);
         ui.label(
-            egui::RichText::new(format!("File: {}", payload.file_name))
+            egui::RichText::new(display_name)
                 .color(BRIGHT_TEXT)
+                .size(16.0)
                 .strong(),
         );
-        ui.label(egui::RichText::new(format!("Type: {}", payload.kind)).color(MUTED_TEXT));
-        ui.label(egui::RichText::new(format!("Source: {}", payload.source)).color(MUTED_TEXT));
-        if let Some(referrer) = &payload.referrer
-            && !self.privacy_settings.minimize_browser_metadata_retention()
-        {
-            ui.label(egui::RichText::new(format!("Referrer: {referrer}")).color(MUTED_TEXT));
-        }
-        ui.add_space(10.0);
-        ui.label(egui::RichText::new("Save To").color(MUTED_TEXT));
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.pending_browser_capture_save_folder)
-                    .desired_width(320.0),
-            );
-            if ui.button("Browse").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_directory(&self.pending_browser_capture_save_folder)
-                    .pick_folder()
-                {
-                    self.pending_browser_capture_save_folder = display_path(&path);
-                }
-            }
-        });
         ui.label(
-            egui::RichText::new(format!("Planned Target Folder: {}", preview_plan.target_folder))
-                .color(ACCENT_WARM),
+            egui::RichText::new(browser_capture_source_summary(&payload.source)).color(MUTED_TEXT),
         );
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical()
+            .max_height(240.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(format!("Type: {}", payload.kind)).color(MUTED_TEXT));
+                read_only_multiline(ui, "Source", &payload.source, 2);
+                if let Some(referrer) = &payload.referrer
+                    && !self.privacy_settings.minimize_browser_metadata_retention()
+                {
+                    read_only_multiline(ui, "Referrer", referrer, 2);
+                }
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("Save To").color(MUTED_TEXT));
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.pending_browser_capture_save_folder)
+                            .desired_width(320.0),
+                    );
+                    if ui.button("Browse").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_directory(&self.pending_browser_capture_save_folder)
+                            .pick_folder()
+                        {
+                            self.pending_browser_capture_save_folder = display_path(&path);
+                        }
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Planned Target Folder: {}",
+                        preview_plan.target_folder
+                    ))
+                    .color(ACCENT_WARM),
+                );
+            });
         ui.add_space(14.0);
         ui.horizontal(|ui| {
             if ui
@@ -1382,11 +1546,14 @@ impl DesktopApp {
         };
 
         let viewport_id = ViewportId::from_hash_of("browser-capture-confirmation");
-        let title = format!("Confirm Download: {}", payload.file_name);
+        let title = format!(
+            "Confirm Download: {}",
+            browser_capture_display_name(&payload)
+        );
         let builder = egui::ViewportBuilder::default()
             .with_title(title)
-            .with_inner_size([520.0, 320.0])
-            .with_min_inner_size([480.0, 280.0])
+            .with_inner_size([520.0, 400.0])
+            .with_min_inner_size([480.0, 360.0])
             .with_always_on_top();
         let builder = if let Some(icon) = load_app_icon() {
             builder.with_icon(icon)
@@ -1429,10 +1596,11 @@ impl DesktopApp {
     }
 
     fn accept_pending_browser_capture(&mut self) {
-        let Some(payload) = self.pending_browser_capture.take() else {
+        let Some(mut payload) = self.pending_browser_capture.take() else {
             return;
         };
 
+        payload.file_name = normalize_browser_capture_file_name(&payload);
         let mut request = payload.into_request();
         let custom_target = self.pending_browser_capture_save_folder.trim().to_owned();
         if !custom_target.is_empty() {
@@ -1545,6 +1713,7 @@ impl DesktopApp {
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if self.tray_show_id.as_ref() == Some(&event.id) {
                 ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(ViewportCommand::Focus);
                 self.start_in_background = false;
                 self.status_message = "NebulaDM restored from the system tray".to_owned();

@@ -11,6 +11,16 @@
       <h1>NebulaDM</h1>
       <p class="subtitle">Browser bridge for the local Rust desktop app.</p>
 
+      <section id="videoPanel" class="videoPanel" hidden>
+        <p class="sectionLabel">Current Video</p>
+        <p id="videoTitle" class="videoTitle">No active video detected.</p>
+        <p id="videoSource" class="videoSource"></p>
+        <div class="videoActions">
+          <button id="downloadVideoButton" type="button">Download Video</button>
+          <button id="queueVideoButton" type="button" class="secondaryButton">Queue Only</button>
+        </div>
+      </section>
+
       <label class="field">
         <span>Bridge URL</span>
         <input id="bridgeUrl" type="text" spellcheck="false">

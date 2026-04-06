@@ -2,14 +2,18 @@
   "manifest_version": 3,
   "name": "NebulaDM Bridge",
   "description": "Capture downloads in the browser and forward them to the local NebulaDM desktop app.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minimum_chrome_version": "114",
   "permissions": [
+    "activeTab",
     "downloads",
+    "scripting",
     "storage",
-    "notifications"
+    "notifications",
+    "webRequest"
   ],
   "host_permissions": [
+    "<all_urls>",
     "http://127.0.0.1:35791/*"
   ],
   "optional_permissions": [
@@ -21,6 +25,17 @@
   "background": {
     "service_worker": "src/background.js"
   },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "src/video-overlay.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
   "action": {
     "default_title": "NebulaDM",
     "default_popup": "src/popup.html"

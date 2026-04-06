@@ -20,12 +20,15 @@ $extensionDest = Join-Path $packageRoot "browser-extension"
 $readmeSource = Join-Path $repoRoot "README.md"
 $readmeDest = Join-Path $packageRoot "README.md"
 $setupDest = Join-Path $packageRoot "SETUP.txt"
+$packagePattern = "NebulaDM-win64-$packageVariant-v*"
 
-if (Test-Path $packageRoot) {
-    Remove-Item -LiteralPath $packageRoot -Recurse -Force
-}
-if (Test-Path $portableZipPath) {
-    Remove-Item -LiteralPath $portableZipPath -Force
+Get-ChildItem -Path $distRoot -Filter $packagePattern -Force -ErrorAction SilentlyContinue | ForEach-Object {
+    if ($_.PSIsContainer) {
+        Remove-Item -LiteralPath $_.FullName -Recurse -Force
+    }
+    else {
+        Remove-Item -LiteralPath $_.FullName -Force
+    }
 }
 New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
 

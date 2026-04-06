@@ -18,6 +18,7 @@ $wizardImage = Join-Path $repoRoot "assets\installer-wizard.bmp"
 $wizardSmallImage = Join-Path $repoRoot "assets\installer-wizard-small.bmp"
 $outputBaseFilename = "NebulaDM-Setup-" + (Get-Date -Format "yyyyMMdd-HHmmss")
 $canonicalInstallerPath = Join-Path $setupDir "NebulaDM-Setup.exe"
+$installerPattern = "NebulaDM-Setup-*.exe"
 
 Write-Host "Preparing NebulaDM release payload..."
 if ($TorrentRqbit) {
@@ -30,6 +31,15 @@ else {
 New-Item -ItemType Directory -Path $installerDir -Force | Out-Null
 New-Item -ItemType Directory -Path $installerOutputDir -Force | Out-Null
 New-Item -ItemType Directory -Path $setupDir -Force | Out-Null
+
+Get-ChildItem -Path $installerOutputDir -Filter $installerPattern -File -Force -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        Remove-Item -LiteralPath $_.FullName -Force
+    }
+
+if (Test-Path $canonicalInstallerPath) {
+    Remove-Item -LiteralPath $canonicalInstallerPath -Force
+}
 
 $appVersion = (Get-Content (Join-Path $repoRoot "apps\desktop\Cargo.toml") | Where-Object { $_ -match '^version = ' } | Select-Object -First 1)
 $appVersion = ($appVersion -replace 'version = "', '') -replace '"', ''

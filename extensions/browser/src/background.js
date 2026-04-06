@@ -7,6 +7,10 @@ const DEFAULT_SETTINGS = {
 };
 
 const pendingCaptures = new Map();
+const VIDEO_EXTENSIONS = [".mp4", ".m4v", ".webm", ".mov", ".mkv", ".avi"];
+const mediaRequestsByTab = new Map();
+const MEDIA_REQUEST_MAX_AGE_MS = 3 * 60 * 1000;
+const MEDIA_REQUEST_LIMIT = 24;
 
 async function getSettings() {
   const stored = await chrome.storage.local.get(DEFAULT_SETTINGS);
@@ -48,6 +52,153 @@ function inferKind(filename, url) {
     return "Torrent";
   }
   return "Direct";
+}
+
+function inferVideoFileName(video) {
+  const candidates = [
+    video?.downloadName,
+    video?.fileName,
+    video?.title,
+    video?.url ? video.url.split("/").pop()?.split("?")[0] : null
+  ];
+
+  for (const candidate of candidates) {
+    const value = (candidate || "").trim();
+    if (!value) {
+      continue;
+    }
+
+    const hasKnownExtension = VIDEO_EXTENSIONS.some((extension) =>
+      value.toLowerCase().endsWith(extension)
+    );
+    if (hasKnownExtension) {
+      return value;
+    }
+  }
+
+  const sanitizedTitle = (video?.title || "video")
+    .replace(/[<>:"/\\|?*\u0000-\u001f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return `${sanitizedTitle || "video"}.mp4`;
+}
+
+function isDownloadableVideoUrl(url) {
+  return /^https?:/i.test(url || "");
+}
+
+function rememberMediaRequest(details) {
+  if (details.tabId < 0 || !isDownloadableVideoUrl(details.url)) {
+    return;
+  }
+
+  const mimeType = details.url.match(/[?&]mime=([^&]+)/i)?.[1] || "";
+  const decodedMime = decodeURIComponent(mimeType || "");
+  const candidate = {
+    url: details.url,
+    type: details.type || "",
+    tabId: details.tabId,
+    timeStamp: Date.now(),
+    initiator: details.initiator || "",
+    mimeType: decodedMime
+  };
+
+  const existing = mediaRequestsByTab.get(details.tabId) || [];
+  const filtered = existing.filter((entry) => entry.url !== candidate.url);
+  filtered.unshift(candidate);
+  mediaRequestsByTab.set(details.tabId, filtered.slice(0, MEDIA_REQUEST_LIMIT));
+}
+
+function scoreVideoCandidate(candidate, tabUrl) {
+  let score = 0;
+  const url = candidate.url || "";
+  const lowerUrl = url.toLowerCase();
+  const mimeType = (candidate.mimeType || "").toLowerCase();
+  const kind = candidate.kind || "";
+
+  if (!isDownloadableVideoUrl(url)) {
+    return -1000;
+  }
+
+  score += 20;
+
+  if (VIDEO_EXTENSIONS.some((extension) => lowerUrl.includes(extension))) {
+    score += 25;
+  }
+
+  if (mimeType.includes("video/")) {
+    score += 35;
+  }
+
+  if (mimeType.includes("audio/")) {
+    score -= 50;
+  }
+
+  if (lowerUrl.includes("googlevideo.com")) {
+    score += 25;
+  }
+
+  if (lowerUrl.includes("videoplayback")) {
+    score += 30;
+  }
+
+  if (kind === "youtube-muxed") {
+    score += 80;
+  } else if (kind === "youtube-adaptive-video") {
+    score += 45;
+  } else if (kind === "video-element") {
+    score += 30;
+  } else if (kind === "network-observed") {
+    score += 20;
+  }
+
+  if (tabUrl && candidate.initiator && tabUrl.startsWith(candidate.initiator)) {
+    score += 10;
+  }
+
+  const ageMs = Date.now() - (candidate.timeStamp || Date.now());
+  score -= Math.min(30, ageMs / 10_000);
+
+  return score;
+}
+
+function pickBestVideoCandidate(video, tabId, tabUrl) {
+  const directCandidates = (video?.candidates || [])
+    .filter((candidate) => isDownloadableVideoUrl(candidate?.url))
+    .map((candidate) => ({
+      url: candidate.url,
+      mimeType: candidate.mimeType || "",
+      kind: candidate.kind || "video-element",
+      initiator: tabUrl || "",
+      timeStamp: Date.now()
+    }));
+
+  if (isDownloadableVideoUrl(video?.url)) {
+    directCandidates.unshift({
+      url: video.url,
+      mimeType: video.mimeType || "",
+      kind: "video-element",
+      initiator: tabUrl || "",
+      timeStamp: Date.now()
+    });
+  }
+
+  const observedCandidates = (mediaRequestsByTab.get(tabId) || [])
+    .filter((candidate) => Date.now() - candidate.timeStamp <= MEDIA_REQUEST_MAX_AGE_MS)
+    .map((candidate) => ({ ...candidate, kind: "network-observed" }));
+
+  const combined = [...directCandidates, ...observedCandidates];
+  if (!combined.length) {
+    return null;
+  }
+
+  return combined
+    .map((candidate) => ({
+      ...candidate,
+      score: scoreVideoCandidate(candidate, tabUrl)
+    }))
+    .sort((left, right) => right.score - left.score)[0];
 }
 
 function inferFileName(item) {
@@ -136,6 +287,49 @@ async function postCapture(payload) {
   return { ok: true };
 }
 
+async function resolveVideoDownload(video, tabId, tabUrl) {
+  const bestCandidate = pickBestVideoCandidate(video, tabId, tabUrl);
+  if (!bestCandidate) {
+    throw new Error(
+      "No downloadable video source was found. This page may be using protected or browser-only streaming."
+    );
+  }
+
+  return {
+    file_name: inferVideoFileName(video),
+    source: bestCandidate.url,
+    referrer: tabUrl || video.pageUrl || null
+  };
+}
+
+async function captureVideoFromTab(video, tabId, tabUrl) {
+  const settings = await getSettings();
+  const resolved = await resolveVideoDownload(video, tabId, tabUrl);
+  const payload = {
+    file_name: resolved.file_name,
+    source: resolved.source,
+    kind: "Direct",
+    referrer: settings.sendReferrer ? resolved.referrer : null,
+    user_agent: settings.sendUserAgent ? navigator.userAgent : null,
+    cookie_header:
+      settings.sendCookies && resolved.source.startsWith("http")
+        ? await getCookieHeader(resolved.source)
+        : null
+  };
+
+  return postCapture(payload);
+}
+
+async function triggerBrowserVideoDownload(video, tabId, tabUrl) {
+  const resolved = await resolveVideoDownload(video, tabId, tabUrl);
+  return chrome.downloads.download({
+    url: resolved.source,
+    filename: resolved.file_name,
+    saveAs: false,
+    conflictAction: "uniquify"
+  });
+}
+
 chrome.runtime.onInstalled.addListener(async () => {
   await chrome.storage.local.set(DEFAULT_SETTINGS);
 });
@@ -170,7 +364,28 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
   return true;
 });
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.webRequest.onBeforeRequest.addListener(
+  (details) => {
+    const lowerUrl = (details.url || "").toLowerCase();
+    const looksLikeMedia =
+      details.type === "media" ||
+      lowerUrl.includes("mime=video") ||
+      lowerUrl.includes("mime=audio") ||
+      lowerUrl.includes("videoplayback") ||
+      VIDEO_EXTENSIONS.some((extension) => lowerUrl.includes(extension));
+
+    if (looksLikeMedia) {
+      rememberMediaRequest(details);
+    }
+  },
+  { urls: ["<all_urls>"] }
+);
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  mediaRequestsByTab.delete(tabId);
+});
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "nebula:get-settings") {
     getSettings().then(sendResponse);
     return true;
@@ -200,6 +415,45 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       await chrome.storage.local.set(nextSettings);
       sendResponse({ ok: true });
     })()
+      .catch((error) => sendResponse({ ok: false, error: String(error) }));
+    return true;
+  }
+
+  if (message?.type === "nebula:capture-video") {
+    captureVideoFromTab(message.video, message.tabId ?? sender.tab?.id ?? -1, message.tabUrl)
+      .then((result) => {
+        if (!result.ok) {
+          sendResponse({
+            ok: false,
+            error:
+              result.reason === "capture disabled"
+                ? "Browser capture is disabled in the extension settings."
+                : "NebulaDM could not queue this video."
+          });
+          return;
+        }
+
+        sendResponse({
+          ok: true,
+          message: `Queued ${inferVideoFileName(message.video)} in NebulaDM without interrupting playback.`
+        });
+      })
+      .catch((error) => sendResponse({ ok: false, error: String(error) }));
+    return true;
+  }
+
+  if (message?.type === "nebula:download-video") {
+    triggerBrowserVideoDownload(
+      message.video,
+      message.tabId ?? sender.tab?.id ?? -1,
+      message.tabUrl
+    )
+      .then(() =>
+        sendResponse({
+          ok: true,
+          message: `Started browser handoff for ${inferVideoFileName(message.video)}.`
+        })
+      )
       .catch((error) => sendResponse({ ok: false, error: String(error) }));
     return true;
   }
