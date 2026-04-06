@@ -113,6 +113,10 @@ impl QueueManager {
         self.snapshot.queue.iter().find(|item| item.id == id)
     }
 
+    pub fn get_record_mut(&mut self, id: u64) -> Option<&mut DownloadRecord> {
+        self.snapshot.queue.iter_mut().find(|item| item.id == id)
+    }
+
     pub fn add_download(
         &mut self,
         file_name: String,

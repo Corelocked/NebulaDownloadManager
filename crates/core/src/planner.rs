@@ -5,6 +5,13 @@ pub fn plan_download(
     downloads_root: &str,
     categories: &[DownloadCategory],
 ) -> DownloadPlan {
+    if let Some(target_folder) = &request.custom_target_folder {
+        return DownloadPlan {
+            category_name: "Custom".to_owned(),
+            target_folder: target_folder.clone(),
+        };
+    }
+
     let extension = request
         .file_name
         .rsplit('.')

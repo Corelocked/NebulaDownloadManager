@@ -48,6 +48,35 @@ This produces a timestamped folder like `dist/NebulaDM-win64-default-YYYYMMDD-HH
 - `README.md`
 - `SETUP.txt`
 
+## Build a Windows installer
+
+NebulaDM now includes a real Windows installer packaging path built around Inno Setup.
+
+1. Open the desktop app and use `Setup Center -> Build Windows Installer` to generate `dist/installer/NebulaDM.iss`
+2. Build the release payload:
+
+```powershell
+pwsh -File .\scripts\build-release.ps1
+```
+
+3. Compile the installer:
+
+```powershell
+pwsh -File .\scripts\build-installer.ps1
+```
+
+If `iscc` is not on your `PATH`, the script will leave the generated `.iss` file in `dist/installer/` and tell you how to compile it manually.
+
+## Auto-update feed
+
+NebulaDM now supports a manifest-driven update check from the desktop app.
+
+- Set an update feed URL in `Setup Center`
+- Click `Check For Updates`
+- If a newer installer is available, NebulaDM downloads it into `%LOCALAPPDATA%\NebulaDM\updates\` and launches it
+
+Use [update-feed.example.json](/d:/Projects/download-manager/assets/update-feed.example.json) as the schema reference for your hosted update manifest.
+
 ## Windows storage paths
 
 - Queue state is stored in the per-user app-data folder for `NebulaDM`

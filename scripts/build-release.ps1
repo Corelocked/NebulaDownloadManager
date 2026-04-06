@@ -66,6 +66,7 @@ Storage
 Bridge
 ------
 - Browser extension target: http://127.0.0.1:35791
+- Chromium browsers normally require unpacked loading or browser-side CRX packaging with a private key
 
 Build Notes
 -----------

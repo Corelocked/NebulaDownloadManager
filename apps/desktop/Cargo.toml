@@ -12,8 +12,15 @@ eframe = "0.33"
 egui = "0.33"
 dirs = "6"
 image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = "0.15"
+tray-icon = "0.21"
+arboard = "3.6"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+semver = "1"
+serde = { version = "1", features = ["derive"] }
 download_core = { path = "../../crates/core" }
 shared = { path = "../../crates/shared" }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+winrt-notification = "0.5"

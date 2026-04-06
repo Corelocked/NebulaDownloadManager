@@ -1,6 +1,10 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
+use arboard::Clipboard;
 #[cfg(feature = "torrent-rqbit")]
 use download_core::torrent_rqbit::{
     ActiveRqbitTorrent, RqbitTorrentCommand, RqbitTorrentEngine, RqbitTorrentEvent,
@@ -23,41 +27,61 @@ use download_core::{
     total_downloaded_mb,
 };
 use eframe::egui;
-use egui::IconData;
+use egui::{IconData, ViewportClass, ViewportCommand, ViewportId};
+use semver::Version;
+use serde::Deserialize;
+#[cfg(windows)]
+use tray_icon::{
+    Icon as TrayIconImage, TrayIcon, TrayIconBuilder,
+    menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
+};
 #[cfg(feature = "torrent-rqbit")]
 use shared::RqbitPersistedState;
 #[cfg(feature = "torrent-rqbit")]
 use shared::TorrentFileEntry;
 use shared::{
     BrowserCapturePayload, DesktopPersistedState, DownloadKind, DownloadRecord, DownloadRequest,
-    DownloadStatus, PrivacySettings, QueueView, TorrentSessionSnapshot,
+    DownloadStatus, DuplicateStrategy, PostDownloadAction, PrivacySettings, QueueView,
+    TorrentSessionSnapshot,
 };
 #[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
 use winreg::{RegKey, enums::HKEY_CURRENT_USER};
+#[cfg(windows)]
+use winrt_notification::{Duration as ToastDuration, Sound, Toast};
 
-const BACKGROUND: egui::Color32 = egui::Color32::from_rgb(11, 15, 24);
-const PANEL: egui::Color32 = egui::Color32::from_rgb(20, 28, 42);
-const PANEL_ALT: egui::Color32 = egui::Color32::from_rgb(28, 38, 56);
-const PANEL_HIGHLIGHT: egui::Color32 = egui::Color32::from_rgb(40, 56, 82);
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(84, 196, 255);
-const ACCENT_WARM: egui::Color32 = egui::Color32::from_rgb(255, 170, 76);
-const SUCCESS: egui::Color32 = egui::Color32::from_rgb(94, 214, 143);
+const BACKGROUND: egui::Color32 = egui::Color32::from_rgb(22, 22, 26);
+const PANEL: egui::Color32 = egui::Color32::from_rgb(33, 33, 39);
+const PANEL_ALT: egui::Color32 = egui::Color32::from_rgb(42, 42, 50);
+const PANEL_HIGHLIGHT: egui::Color32 = egui::Color32::from_rgb(31, 212, 228);
+const PANEL_SUBTLE: egui::Color32 = egui::Color32::from_rgb(26, 26, 32);
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(31, 212, 228);
+const ACCENT_WARM: egui::Color32 = egui::Color32::from_rgb(241, 173, 225);
+const SUCCESS: egui::Color32 = egui::Color32::from_rgb(120, 237, 220);
 const DANGER: egui::Color32 = egui::Color32::from_rgb(237, 108, 88);
-const MUTED_TEXT: egui::Color32 = egui::Color32::from_rgb(154, 168, 189);
-const BRIGHT_TEXT: egui::Color32 = egui::Color32::from_rgb(236, 241, 248);
+const MUTED_TEXT: egui::Color32 = egui::Color32::from_rgb(177, 180, 188);
+const BRIGHT_TEXT: egui::Color32 = egui::Color32::from_rgb(244, 246, 250);
+const OUTLINE: egui::Color32 = egui::Color32::from_rgb(66, 71, 83);
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 fn main() -> eframe::Result<()> {
-    let launch_request = std::env::args().skip(1).find_map(parse_launch_request);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let launch_request = args.iter().cloned().find_map(parse_launch_request);
+    let start_in_background = args.iter().any(|arg| arg == "--background");
     let viewport = match load_app_icon() {
         Some(icon) => egui::ViewportBuilder::default()
             .with_inner_size([1120.0, 720.0])
             .with_min_inner_size([900.0, 600.0])
             .with_title("NebulaDM")
+            .with_visible(!start_in_background)
             .with_icon(icon),
         None => egui::ViewportBuilder::default()
             .with_inner_size([1120.0, 720.0])
             .with_min_inner_size([900.0, 600.0])
-            .with_title("NebulaDM"),
+            .with_title("NebulaDM")
+            .with_visible(!start_in_background),
     };
     let options = eframe::NativeOptions {
         viewport,
@@ -67,7 +91,12 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "NebulaDM",
         options,
-        Box::new(move |_cc| Ok(Box::new(DesktopApp::new(launch_request.clone())))),
+        Box::new(move |_cc| {
+            Ok(Box::new(DesktopApp::new(
+                launch_request.clone(),
+                start_in_background,
+            )))
+        }),
     )
 }
 
@@ -81,6 +110,14 @@ fn load_app_icon() -> Option<IconData> {
         width,
         height,
     })
+}
+
+#[cfg(windows)]
+fn load_tray_icon() -> Option<TrayIconImage> {
+    let bytes = include_bytes!("../../../assets/nebuladm-logo.png");
+    let image = image::load_from_memory(bytes).ok()?.into_rgba8();
+    let (width, height) = image.dimensions();
+    TrayIconImage::from_rgba(image.into_raw(), width, height).ok()
 }
 
 const APP_DIR_NAME: &str = "NebulaDM";
@@ -182,6 +219,21 @@ impl DownloadTab {
     }
 }
 
+#[derive(Debug, Clone)]
+struct AppNotification {
+    id: u64,
+    title: String,
+    body: String,
+    created_at: Instant,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct UpdateManifest {
+    version: String,
+    installer_url: String,
+    notes_url: Option<String>,
+}
+
 struct DesktopApp {
     selected_tab: DownloadTab,
     queue_manager: QueueManager,
@@ -189,19 +241,49 @@ struct DesktopApp {
     storage_path: PathBuf,
     desktop_state_path: PathBuf,
     privacy_settings: PrivacySettings,
+    run_on_startup: bool,
+    clipboard_watch_enabled: bool,
+    native_notifications_enabled: bool,
+    update_feed_url: String,
+    duplicate_strategy: DuplicateStrategy,
+    post_download_action: PostDownloadAction,
+    start_in_background: bool,
     new_name: String,
     new_source: String,
+    batch_import_sources: String,
     new_kind: DownloadKind,
     status_message: String,
+    recent_download_targets: Vec<String>,
+    notifications: Vec<AppNotification>,
+    notification_serial: u64,
+    last_clipboard_value: Option<String>,
+    last_clipboard_poll_at: Instant,
+    show_setup_center: bool,
     pending_delete_history_confirmation: bool,
     pending_delete_confirmation_job_id: Option<u64>,
     expanded_details_job_id: Option<u64>,
     pending_browser_capture: Option<BrowserCapturePayload>,
+    pending_browser_capture_save_folder: String,
     pending_launch_start_job_id: Option<u64>,
+    #[cfg(windows)]
+    tray_icon: Option<TrayIcon>,
+    #[cfg(windows)]
+    tray_show_id: Option<MenuId>,
+    #[cfg(windows)]
+    tray_hide_id: Option<MenuId>,
+    #[cfg(windows)]
+    tray_quit_id: Option<MenuId>,
+    #[cfg(windows)]
+    tray_pause_id: Option<MenuId>,
+    #[cfg(windows)]
+    tray_resume_id: Option<MenuId>,
+    #[cfg(windows)]
+    tray_recent_id: Option<MenuId>,
+    #[cfg(windows)]
+    quit_requested: bool,
     active_direct_job_id: Option<u64>,
     active_direct_download: Option<ActiveDirectDownload>,
     browser_bridge: Option<BrowserBridge>,
-    browser_bridge_addr: String,
     active_torrent_job_id: Option<u64>,
     active_torrent_plan: Option<TorrentTaskPlan>,
     active_torrent_session: Option<TorrentSessionSnapshot>,
@@ -226,7 +308,75 @@ struct DesktopApp {
 }
 
 impl DesktopApp {
-    fn new(launch_request: Option<DownloadRequest>) -> Self {
+    fn card_frame(&self, fill: egui::Color32) -> egui::Frame {
+        egui::Frame::new()
+            .fill(fill)
+            .stroke(egui::Stroke::new(1.0, OUTLINE))
+            .corner_radius(20.0)
+            .inner_margin(egui::Margin::symmetric(18, 16))
+    }
+
+    fn section_heading(&self, ui: &mut egui::Ui, title: &str, subtitle: &str) {
+        ui.label(
+            egui::RichText::new(title)
+                .size(18.0)
+                .strong()
+                .color(BRIGHT_TEXT),
+        );
+        ui.label(egui::RichText::new(subtitle).color(MUTED_TEXT));
+        ui.add_space(8.0);
+    }
+
+    fn stat_card(
+        &self,
+        ui: &mut egui::Ui,
+        title: &str,
+        value: String,
+        accent: egui::Color32,
+        detail: &str,
+    ) {
+        self.card_frame(PANEL_SUBTLE).show(ui, |ui| {
+            ui.label(egui::RichText::new(title).color(MUTED_TEXT));
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(value)
+                    .size(24.0)
+                    .strong()
+                    .color(accent),
+            );
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(detail).color(MUTED_TEXT));
+        });
+    }
+
+    fn compact_action_button(
+        &self,
+        ui: &mut egui::Ui,
+        label: &str,
+        fill: egui::Color32,
+        enabled: bool,
+        tooltip: &str,
+        emphasized: bool,
+    ) -> egui::Response {
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(
+                egui::RichText::new(label)
+                    .size(14.0)
+                    .color(if emphasized { BRIGHT_TEXT } else { MUTED_TEXT }),
+            )
+                .fill(if emphasized {
+                    fill
+                } else {
+                    fill.linear_multiply(0.45)
+                })
+                .corner_radius(10.0)
+                .min_size(egui::vec2(34.0, 28.0)),
+        )
+        .on_hover_text(tooltip)
+    }
+
+    fn new(launch_request: Option<DownloadRequest>, start_in_background: bool) -> Self {
         let app_state_dir = resolve_app_state_dir();
         let download_root = resolve_download_root();
         let storage_path = app_state_dir.join("snapshot.json");
@@ -247,25 +397,44 @@ impl DesktopApp {
             pending_launch_start_job_id = Some(id);
         }
 
-        let browser_bridge_addr = "127.0.0.1:35791".to_owned();
-        let browser_bridge = start_browser_bridge(&browser_bridge_addr).ok();
+        let browser_bridge = start_browser_bridge("127.0.0.1:35791").ok();
         let auto_register_status = auto_register_magnet_protocol();
+        let startup_status = sync_run_on_startup(desktop_state.run_on_startup);
         let status_message = match auto_register_status {
             Some(message) => format!("{status_message} | {message}"),
             None => status_message,
         };
+        let status_message = match startup_status {
+            Some(message) => format!("{status_message} | {message}"),
+            None => status_message,
+        };
+        let pending_browser_capture_save_folder = display_path(&download_root);
 
-        Self {
+        let mut app = Self {
             selected_tab,
             queue_manager,
             selected_view,
             storage_path,
             desktop_state_path,
             privacy_settings: desktop_state.privacy.clone(),
-            new_name: "fedora-workstation.iso".to_owned(),
-            new_source: "https://download.fedoraproject.org/pub/fedora.iso".to_owned(),
+            run_on_startup: desktop_state.run_on_startup,
+            clipboard_watch_enabled: desktop_state.clipboard_watch_enabled,
+            native_notifications_enabled: desktop_state.native_notifications_enabled,
+            update_feed_url: desktop_state.update_feed_url.clone(),
+            duplicate_strategy: desktop_state.duplicate_strategy,
+            post_download_action: desktop_state.post_download_action,
+            start_in_background,
+            new_name: String::new(),
+            new_source: String::new(),
+            batch_import_sources: String::new(),
             new_kind: DownloadKind::Direct,
             status_message,
+            recent_download_targets: Vec::new(),
+            notifications: Vec::new(),
+            notification_serial: 0,
+            last_clipboard_value: None,
+            last_clipboard_poll_at: Instant::now(),
+            show_setup_center: false,
             pending_delete_history_confirmation: false,
             pending_delete_confirmation_job_id: None,
             expanded_details_job_id: {
@@ -279,11 +448,27 @@ impl DesktopApp {
                 }
             },
             pending_browser_capture: None,
+            pending_browser_capture_save_folder,
             pending_launch_start_job_id,
+            #[cfg(windows)]
+            tray_icon: None,
+            #[cfg(windows)]
+            tray_show_id: None,
+            #[cfg(windows)]
+            tray_hide_id: None,
+            #[cfg(windows)]
+            tray_quit_id: None,
+            #[cfg(windows)]
+            tray_pause_id: None,
+            #[cfg(windows)]
+            tray_resume_id: None,
+            #[cfg(windows)]
+            tray_recent_id: None,
+            #[cfg(windows)]
+            quit_requested: false,
             active_direct_job_id: None,
             active_direct_download: None,
             browser_bridge,
-            browser_bridge_addr,
             active_torrent_job_id: None,
             active_torrent_plan: None,
             active_torrent_session: None,
@@ -328,23 +513,47 @@ impl DesktopApp {
                 .unwrap_or(0),
             #[cfg(feature = "torrent-rqbit")]
             pending_rqbit_restore: desktop_state.rqbit,
-        }
+        };
+
+        #[cfg(windows)]
+        app.init_tray_icon();
+
+        app
     }
 }
 
 impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_theme(ctx);
+        #[cfg(windows)]
+        self.handle_tray_events(ctx);
+        #[cfg(windows)]
+        self.handle_root_close_to_tray(ctx);
         self.handle_launch_request_if_needed();
         #[cfg(feature = "torrent-rqbit")]
         self.restore_rqbit_job_if_needed();
+        self.poll_clipboard_for_download_links();
         self.poll_direct_events();
         self.poll_browser_bridge();
         #[cfg(feature = "torrent-rqbit")]
         self.poll_rqbit_torrent_events();
         self.tick_torrent_session();
-        ctx.request_repaint_after(std::time::Duration::from_millis(150));
+        let has_active_work = self.active_direct_job_id.is_some()
+            || self.active_torrent_job_id.is_some()
+            || self.pending_browser_capture.is_some()
+            || !self.notifications.is_empty();
+        ctx.request_repaint_after(std::time::Duration::from_millis(if has_active_work {
+            150
+        } else {
+            1000
+        }));
         let snapshot = self.queue_manager.snapshot().clone();
+
+        #[cfg(windows)]
+        if self.quit_requested {
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+            return;
+        }
         let visible_records: Vec<DownloadRecord> = self
             .queue_manager
             .snapshot()
@@ -360,156 +569,268 @@ impl eframe::App for DesktopApp {
         egui::TopBottomPanel::top("top_bar")
             .frame(
                 egui::Frame::new()
-                    .fill(PANEL)
-                    .inner_margin(egui::Margin::symmetric(20, 18)),
+                    .fill(BACKGROUND)
+                    .inner_margin(egui::Margin::ZERO),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new("NebulaDM")
-                                .size(28.0)
-                                .strong()
-                                .color(BRIGHT_TEXT),
-                        );
-                        ui.label(
-                            egui::RichText::new(
-                                "Fast direct downloads, integrated torrents, and browser capture in one desktop app",
-                            )
-                            .color(MUTED_TEXT),
-                        );
-                    });
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(8.0);
-                        let bridge_badge = egui::Frame::new()
-                            .fill(PANEL_HIGHLIGHT)
-                            .corner_radius(12.0)
-                            .inner_margin(egui::Margin::symmetric(12, 8));
-                        bridge_badge.show(ui, |ui| {
+                egui::Frame::new()
+                    .fill(PANEL_SUBTLE)
+                    .stroke(egui::Stroke::new(0.0, egui::Color32::TRANSPARENT))
+                    .inner_margin(egui::Margin::symmetric(16, 10))
+                    .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
                             ui.label(
-                                egui::RichText::new(format!("Bridge: {}", self.browser_bridge_addr))
-                                    .color(ACCENT),
+                                egui::RichText::new("NebulaDM")
+                                    .size(22.0)
+                                    .strong()
+                                    .color(BRIGHT_TEXT),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "A focused download command center for direct links, browser handoff, and torrents.",
+                                )
+                                .color(MUTED_TEXT),
+                            );
+                        });
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            self.pill(
+                                ui,
+                                if self.privacy_settings.privacy_mode {
+                                    "Privacy On"
+                                } else {
+                                    "Privacy Relaxed"
+                                },
+                                if self.privacy_settings.privacy_mode {
+                                    SUCCESS
+                                } else {
+                                    ACCENT_WARM
+                                },
+                            );
+                            self.pill(
+                                ui,
+                                if self.run_on_startup {
+                                    "Background Ready"
+                                } else {
+                                    "Manual Launch"
+                                },
+                                ACCENT,
                             );
                         });
                     });
                 });
-        });
+            });
 
         egui::SidePanel::left("sidebar")
-            .min_width(210.0)
+            .min_width(240.0)
+            .max_width(240.0)
             .frame(
                 egui::Frame::new()
-                    .fill(PANEL)
-                    .inner_margin(egui::Margin::symmetric(18, 18)),
+                    .fill(PANEL_SUBTLE)
+                    .inner_margin(egui::Margin::ZERO),
             )
             .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new("Queues")
-                        .size(20.0)
-                        .strong()
-                        .color(BRIGHT_TEXT),
-                );
-                ui.add_space(8.0);
-                for view in QueueView::ALL {
-                    let count = self
-                        .queue_manager
-                        .snapshot()
-                        .queue
-                        .iter()
-                        .filter(|item| item.is_visible_in(view))
-                        .count();
-                    let selected = self.selected_view == view;
-                    let label = format!("{} ({count})", view.label());
-                    let button = egui::Button::new(egui::RichText::new(label).color(if selected {
-                        BRIGHT_TEXT
-                    } else {
-                        MUTED_TEXT
-                    }))
-                    .fill(if selected { PANEL_HIGHLIGHT } else { PANEL_ALT })
-                    .corner_radius(12.0)
-                    .min_size(egui::vec2(ui.available_width(), 36.0));
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(16.0);
+                        ui.label(
+                            egui::RichText::new("Nebula DM")
+                                .strong()
+                                .color(BRIGHT_TEXT),
+                        );
+                    });
+                    ui.add_space(14.0);
+                    egui::Frame::new()
+                        .fill(PANEL_SUBTLE)
+                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .show(ui, |ui| {
+                        for view in QueueView::ALL {
+                            let count = self
+                                .queue_manager
+                                .snapshot()
+                                .queue
+                                .iter()
+                                .filter(|item| item.is_visible_in(view))
+                                .count();
+                            let selected = self.selected_view == view;
+                            let label = format!("{} ({count})", view.label());
+                            let button = egui::Button::new(egui::RichText::new(label).color(if selected {
+                                BRIGHT_TEXT
+                            } else {
+                                MUTED_TEXT
+                            }))
+                            .fill(if selected { PANEL_HIGHLIGHT } else { PANEL_SUBTLE })
+                            .corner_radius(14.0)
+                            .min_size(egui::vec2(ui.available_width(), 40.0));
 
-                    if ui.add(button).clicked() {
-                        self.selected_view = view;
-                    }
-                    ui.add_space(6.0);
-                }
+                            if ui.add(button).clicked() {
+                                self.selected_view = view;
+                            }
+                            ui.add_space(6.0);
+                        }
+                    });
 
-                ui.add_space(16.0);
-                ui.label(
-                    egui::RichText::new("Status")
-                        .size(18.0)
-                        .strong()
-                        .color(BRIGHT_TEXT),
-                );
-                ui.label(
-                    egui::RichText::new(format!("Active: {}", active_count(&snapshot)))
-                        .color(MUTED_TEXT),
-                );
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Downloaded: {:.1} MB",
-                        total_downloaded_mb(&snapshot)
-                    ))
-                    .color(MUTED_TEXT),
-                );
-                ui.label(
-                    egui::RichText::new(format!("Engine: {}", self.torrent_engine_label()))
-                        .color(MUTED_TEXT),
-                );
-                ui.add_space(12.0);
-                ui.label(
-                    egui::RichText::new("Privacy")
-                        .size(18.0)
-                        .strong()
-                        .color(BRIGHT_TEXT),
-                );
-                let mut privacy_mode = self.privacy_settings.privacy_mode;
-                if ui.checkbox(&mut privacy_mode, "Privacy Mode").changed() {
-                    self.set_privacy_mode(privacy_mode);
-                }
-                ui.label(
-                    egui::RichText::new(
-                        "Enforces auto-stop, no seeding, minimal metadata retention, and quieter local state.",
-                    )
-                    .color(MUTED_TEXT),
-                );
-                let delete_label = if self.pending_delete_history_confirmation {
-                    "Confirm Delete History + Metadata"
-                } else {
-                    "Delete History + Metadata"
-                };
-                if ui.button(delete_label).clicked() {
-                    self.request_delete_history_and_metadata();
-                }
-                if ui.button("Setup Browser Extension").clicked() {
-                    self.open_browser_extension_setup();
-                }
-                if ui.button("Register Magnet Links").clicked() {
-                    self.register_magnet_protocol();
-                }
-                #[cfg(feature = "torrent-rqbit")]
-                if let Some(name) = &self.rqbit_torrent_name {
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("Live Torrent")
-                            .color(MUTED_TEXT)
-                            .strong(),
-                    );
-                    ui.label(egui::RichText::new(name).color(BRIGHT_TEXT));
-                    ui.label(
-                        egui::RichText::new(format!("Peers: {}", self.rqbit_peer_count))
+                    ui.add_space(10.0);
+                    self.card_frame(PANEL).show(ui, |ui| {
+                        self.section_heading(ui, "Workspace", "A fast snapshot of the app and current engine.");
+                        ui.label(
+                            egui::RichText::new(format!("Active transfers: {}", active_count(&snapshot)))
+                                .color(ACCENT)
+                                .strong(),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Downloaded so far: {:.1} MB",
+                                total_downloaded_mb(&snapshot)
+                            ))
+                            .color(SUCCESS),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("Torrent engine: {}", self.torrent_engine_label()))
+                                .color(ACCENT_WARM),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(if self.start_in_background {
+                                "Launches quietly and stays ready in the tray."
+                            } else {
+                                "Opens normally and stays visible until you hide it."
+                            })
                             .color(MUTED_TEXT),
-                    );
-                }
+                        );
+                        #[cfg(feature = "torrent-rqbit")]
+                        if let Some(name) = &self.rqbit_torrent_name {
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("Live Torrent").strong().color(BRIGHT_TEXT));
+                            ui.label(egui::RichText::new(name).color(BRIGHT_TEXT));
+                            ui.label(
+                                egui::RichText::new(format!("Peers connected: {}", self.rqbit_peer_count))
+                                    .color(MUTED_TEXT),
+                            );
+                        }
+                    });
+
+                    ui.add_space(10.0);
+                    self.card_frame(PANEL).show(ui, |ui| {
+                        self.section_heading(ui, "Preferences", "Privacy, startup behavior, duplicates, and completion flow.");
+                        let mut privacy_mode = self.privacy_settings.privacy_mode;
+                        if ui.checkbox(&mut privacy_mode, "Privacy Mode").changed() {
+                            self.set_privacy_mode(privacy_mode);
+                        }
+                        ui.add_space(8.0);
+                        let mut run_on_startup = self.run_on_startup;
+                        if ui.checkbox(&mut run_on_startup, "Run on startup in background").changed() {
+                            self.set_run_on_startup(run_on_startup);
+                        }
+                        if ui
+                            .checkbox(&mut self.clipboard_watch_enabled, "Watch clipboard for links")
+                            .changed()
+                        {
+                            self.save_desktop_state();
+                        }
+                        if ui
+                            .checkbox(
+                                &mut self.native_notifications_enabled,
+                                "Use native Windows notifications",
+                            )
+                            .changed()
+                        {
+                            self.save_desktop_state();
+                        }
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Duplicate File Rule").color(MUTED_TEXT));
+                        let previous_duplicate_strategy = self.duplicate_strategy;
+                        egui::ComboBox::from_id_salt("duplicate_strategy")
+                            .selected_text(self.duplicate_strategy.to_string())
+                            .width(ui.available_width())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.duplicate_strategy,
+                                    DuplicateStrategy::Rename,
+                                    "Rename",
+                                );
+                                ui.selectable_value(
+                                    &mut self.duplicate_strategy,
+                                    DuplicateStrategy::Overwrite,
+                                    "Overwrite",
+                                );
+                                ui.selectable_value(
+                                    &mut self.duplicate_strategy,
+                                    DuplicateStrategy::Skip,
+                                    "Skip",
+                                );
+                            });
+                        if self.duplicate_strategy != previous_duplicate_strategy {
+                            self.save_desktop_state();
+                        }
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("After Download").color(MUTED_TEXT));
+                        let previous_post_download_action = self.post_download_action;
+                        egui::ComboBox::from_id_salt("post_download_action")
+                            .selected_text(self.post_download_action.to_string())
+                            .width(ui.available_width())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.post_download_action,
+                                    PostDownloadAction::None,
+                                    "Do nothing",
+                                );
+                                ui.selectable_value(
+                                    &mut self.post_download_action,
+                                    PostDownloadAction::OpenFile,
+                                    "Open file",
+                                );
+                                ui.selectable_value(
+                                    &mut self.post_download_action,
+                                    PostDownloadAction::OpenFolder,
+                                    "Open folder",
+                                );
+                            });
+                        if self.post_download_action != previous_post_download_action {
+                            self.save_desktop_state();
+                        }
+                    });
+
+                    ui.add_space(10.0);
+                    self.card_frame(PANEL).show(ui, |ui| {
+                        self.section_heading(ui, "Tools", "Quick actions for setup, associations, and cleanup.");
+                        if ui
+                            .add(
+                                egui::Button::new("Open Setup Center")
+                                    .fill(PANEL_HIGHLIGHT)
+                                    .corner_radius(14.0)
+                                    .min_size(egui::vec2(ui.available_width(), 38.0)),
+                            )
+                            .clicked()
+                        {
+                            self.show_setup_center = true;
+                        }
+                        let delete_label = if self.pending_delete_history_confirmation {
+                            "Confirm Delete History + Metadata"
+                        } else {
+                            "Delete History + Metadata"
+                        };
+                        if ui.button(delete_label).clicked() {
+                            self.request_delete_history_and_metadata();
+                        }
+                        if ui.button("Setup Browser Extension").clicked() {
+                            self.open_browser_extension_setup();
+                        }
+                        if ui.button("Register Magnet Links").clicked() {
+                            self.register_magnet_protocol();
+                        }
+                    });
+                });
             });
 
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .fill(BACKGROUND)
-                    .inner_margin(egui::Margin::symmetric(18, 18)),
+                    .inner_margin(egui::Margin::symmetric(14, 12)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -532,51 +853,92 @@ impl eframe::App for DesktopApp {
                         }
                     }
                 });
-                ui.add_space(14.0);
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
+                ui.add_space(12.0);
+                self.card_frame(PANEL).show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} | {}",
+                            self.selected_tab.label(),
+                            self.selected_view.label()
+                        ))
+                        .size(24.0)
+                        .strong()
+                        .color(BRIGHT_TEXT),
+                    );
+                    ui.label(
+                        egui::RichText::new(self.selected_tab.subtitle()).color(MUTED_TEXT),
+                    );
+                    ui.add_space(12.0);
+                    ui.columns(3, |columns| {
+                        self.stat_card(
+                            &mut columns[0],
+                            "Visible Items",
+                            visible_records.len().to_string(),
+                            ACCENT,
+                            "Shown in this tab and filter",
+                        );
+                        self.stat_card(
+                            &mut columns[1],
+                            "Clipboard Watcher",
+                            if self.clipboard_watch_enabled {
+                                "On".to_owned()
+                            } else {
+                                "Off".to_owned()
+                            },
+                            if self.clipboard_watch_enabled {
+                                SUCCESS
+                            } else {
+                                MUTED_TEXT
+                            },
+                            "Auto-detect copied links",
+                        );
+                        self.stat_card(
+                            &mut columns[2],
+                            "Tray Mode",
+                            if self.run_on_startup {
+                                "Ready".to_owned()
+                            } else {
+                                "Manual".to_owned()
+                            },
+                            ACCENT_WARM,
+                            "Background-friendly startup",
+                        );
+                    });
+                });
+                ui.add_space(10.0);
+                self.render_quick_add_panel(ui, &snapshot);
+
+                ui.add_space(12.0);
+
+                if visible_records.is_empty() {
+                    self.card_frame(PANEL).show(ui, |ui| {
                         ui.label(
-                            egui::RichText::new(format!(
-                                "{} | {}",
-                                self.selected_tab.label(),
-                                self.selected_view.label()
-                            ))
-                                .size(24.0)
+                            egui::RichText::new("Nothing here yet")
+                                .size(20.0)
                                 .strong()
                                 .color(BRIGHT_TEXT),
                         );
                         ui.label(
-                            egui::RichText::new(self.selected_tab.subtitle()).color(MUTED_TEXT),
+                            egui::RichText::new(format!(
+                                "Matching {} items will appear here when they enter the {} queue.",
+                                self.selected_tab.label().to_ascii_lowercase(),
+                                self.selected_view.label().to_ascii_lowercase()
+                            ))
+                            .color(MUTED_TEXT),
                         );
                     });
-                });
-                self.render_quick_add_panel(ui, &snapshot);
-
-            ui.add_space(14.0);
-
-            if visible_records.is_empty() {
-                egui::Frame::new()
-                    .fill(PANEL)
-                    .corner_radius(18.0)
-                    .inner_margin(egui::Margin::symmetric(18, 18))
-                    .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new("No items in this view")
-                            .size(20.0)
-                            .strong()
-                            .color(BRIGHT_TEXT),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Matching {} items will appear here when they enter the {} queue.",
-                            self.selected_tab.label().to_ascii_lowercase(),
-                            self.selected_view.label().to_ascii_lowercase()
-                        ))
-                            .color(MUTED_TEXT),
-                    );
-                });
-            } else {
-                for record in visible_records {
+                } else {
+                    self.card_frame(PANEL).show(ui, |ui| {
+                        ui.columns(5, |columns| {
+                            columns[0].label(egui::RichText::new("File Name").strong().color(MUTED_TEXT));
+                            columns[1].label(egui::RichText::new("Status").strong().color(MUTED_TEXT));
+                            columns[2].label(egui::RichText::new("Speed").strong().color(MUTED_TEXT));
+                            columns[3].label(egui::RichText::new("Progress").strong().color(MUTED_TEXT));
+                            columns[4].label(egui::RichText::new("Actions").strong().color(MUTED_TEXT));
+                        });
+                    });
+                    ui.add_space(8.0);
+                    for record in visible_records {
                     let plan = plan_download(
                         &record.request,
                         &snapshot.downloads_root,
@@ -585,62 +947,82 @@ impl eframe::App for DesktopApp {
 
                     let row_response = egui::Frame::new()
                         .fill(PANEL)
-                        .stroke(egui::Stroke::new(1.0, PANEL_HIGHLIGHT))
-                        .corner_radius(18.0)
-                        .inner_margin(egui::Margin::symmetric(18, 16))
+                        .stroke(egui::Stroke::new(1.0, OUTLINE.linear_multiply(0.7)))
+                        .corner_radius(16.0)
+                        .inner_margin(egui::Margin::symmetric(16, 14))
                         .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
+                        let row_hovered = ui.rect_contains_pointer(ui.max_rect());
+                        let accent_fill = if row_hovered {
+                            match record.request.kind {
+                                DownloadKind::Direct => ACCENT.linear_multiply(0.05),
+                                DownloadKind::Torrent => ACCENT_WARM.linear_multiply(0.05),
+                            }
+                        } else {
+                            PANEL
+                        };
+                        ui.painter().rect_filled(ui.max_rect(), 16.0, accent_fill);
+                        ui.painter().rect_stroke(
+                            ui.max_rect(),
+                            16.0,
+                            egui::Stroke::new(
+                                if row_hovered { 1.2 } else { 1.0 },
+                                if row_hovered {
+                                    match record.request.kind {
+                                        DownloadKind::Direct => ACCENT.linear_multiply(0.7),
+                                        DownloadKind::Torrent => ACCENT_WARM.linear_multiply(0.7),
+                                    }
+                                } else {
+                                    OUTLINE.linear_multiply(0.7)
+                                },
+                            ),
+                            egui::StrokeKind::Inside,
+                        );
+                        ui.columns(5, |columns| {
+                            columns[0].vertical(|ui| {
                                 ui.label(
                                     egui::RichText::new(&record.request.file_name)
-                                        .size(20.0)
                                         .strong()
-                                        .color(BRIGHT_TEXT),
-                                );
-                                ui.horizontal(|ui| {
-                                    self.pill(
-                                        ui,
-                                        &record.request.kind.to_string(),
-                                        match record.request.kind {
+                                        .color(match record.request.kind {
                                             DownloadKind::Direct => ACCENT,
                                             DownloadKind::Torrent => ACCENT_WARM,
-                                        },
-                                    );
-                                    self.pill(
-                                        ui,
-                                        &record.status.to_string(),
-                                        self.status_color(&record.status.to_string()),
-                                    );
-                                });
+                                        }),
+                                );
+                                ui.label(egui::RichText::new(&record.request.source).small().color(MUTED_TEXT));
                             });
-                            ui.add_space(10.0);
-                            let details_label = if self.expanded_details_job_id == Some(record.id) {
-                                "Hide Details"
-                            } else {
-                                "Details"
-                            };
-                            if ui.button(details_label).clicked() {
-                                self.toggle_details_for(record.id);
-                            }
-                            if record.request.kind == DownloadKind::Torrent {
-                            }
-                        });
-                        ui.label(egui::RichText::new(&record.request.source).color(MUTED_TEXT));
-                        ui.add(
-                            egui::ProgressBar::new(record.progress_percent / 100.0)
-                                .desired_width(ui.available_width())
-                                .fill(ACCENT)
-                                .text(format!("{:.1}%", record.progress_percent)),
-                        );
-                        ui.horizontal(|ui| {
-                            ui.monospace(format!(
-                                "{:.1}/{:.1} MB",
-                                record.downloaded_mb, record.total_mb
-                            ));
-                            ui.monospace(format!("Speed: {:.1} MB/s", record.speed_mbps));
-                            ui.monospace(format!("ETA: {}", record.eta_text));
-                        });
-                        ui.horizontal(|ui| {
+                            columns[1].vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new(record.request.kind.to_string())
+                                        .strong()
+                                        .color(match record.request.kind {
+                                            DownloadKind::Direct => ACCENT,
+                                            DownloadKind::Torrent => ACCENT_WARM,
+                                        }),
+                                );
+                                ui.label(
+                                    egui::RichText::new(record.status.to_string())
+                                        .color(self.status_color(&record.status.to_string())),
+                                );
+                            });
+                            columns[2].vertical(|ui| {
+                                ui.monospace(format!("{:.2} MB/s", record.speed_mbps));
+                                ui.label(egui::RichText::new(record.eta_text.clone()).color(MUTED_TEXT));
+                            });
+                            columns[3].vertical(|ui| {
+                                ui.add(
+                                    egui::ProgressBar::new(record.progress_percent / 100.0)
+                                        .desired_width(110.0)
+                                        .fill(match record.request.kind {
+                                            DownloadKind::Direct => ACCENT,
+                                            DownloadKind::Torrent => ACCENT_WARM,
+                                        })
+                                        .text(format!("{:.0}%", record.progress_percent)),
+                                );
+                                ui.monospace(format!(
+                                    "{:.1}/{:.1} MB",
+                                    record.downloaded_mb, record.total_mb
+                                ));
+                            });
+                            columns[4].horizontal(|ui| {
                             let can_pause = matches!(
                                 record.status,
                                 DownloadStatus::Downloading
@@ -649,20 +1031,67 @@ impl eframe::App for DesktopApp {
                                 record.status,
                                 DownloadStatus::Paused | DownloadStatus::Queued | DownloadStatus::Failed
                             );
-                            if ui
-                                .add_enabled(can_pause, egui::Button::new("Pause"))
+                            if self
+                                .compact_action_button(
+                                    ui,
+                                    "⏸",
+                                    PANEL_ALT,
+                                    can_pause,
+                                    "Pause download",
+                                    row_hovered,
+                                )
                                 .clicked()
                             {
                                 self.pending_delete_confirmation_job_id = None;
                                 self.request_pause_for(record.id);
                             }
-                            if ui
-                                .add_enabled(can_resume, egui::Button::new("Resume"))
+                            if self
+                                .compact_action_button(
+                                    ui,
+                                    "▶",
+                                    PANEL_HIGHLIGHT,
+                                    can_resume,
+                                    "Resume download",
+                                    row_hovered,
+                                )
                                 .clicked()
                             {
                                 self.pending_delete_confirmation_job_id = None;
                                 self.request_resume_for(record.id);
                             }
+                            let details_label = if self.expanded_details_job_id == Some(record.id) {
+                                "▾"
+                            } else {
+                                "⋯"
+                            };
+                            if self
+                                .compact_action_button(
+                                    ui,
+                                    details_label,
+                                    PANEL_ALT,
+                                    true,
+                                    "Show details",
+                                    row_hovered || self.expanded_details_job_id == Some(record.id),
+                                )
+                                .clicked()
+                            {
+                                self.toggle_details_for(record.id);
+                            }
+                            if self
+                                .compact_action_button(
+                                    ui,
+                                    "✕",
+                                    DANGER,
+                                    true,
+                                    "Remove from queue",
+                                    row_hovered,
+                                )
+                                .clicked()
+                            {
+                                self.pending_delete_confirmation_job_id = None;
+                                self.request_remove_for(record.id);
+                            }
+                            });
                         });
                         if self.pending_delete_confirmation_job_id == Some(record.id) {
                             ui.colored_label(
@@ -685,11 +1114,12 @@ impl eframe::App for DesktopApp {
 
                     ui.add_space(10.0);
                 }
-            }
+                }
+            });
 
-        });
-
-        self.render_browser_capture_confirmation(ctx);
+        self.render_browser_capture_confirmation_popup(ctx);
+        self.render_setup_center(ctx);
+        self.render_notification_toasts(ctx);
     }
 }
 
@@ -752,50 +1182,84 @@ impl DesktopApp {
     }
 
     fn render_quick_add_panel(&mut self, ui: &mut egui::Ui, snapshot: &shared::AppSnapshot) {
-        egui::Frame::new()
-            .fill(PANEL)
-            .corner_radius(18.0)
-            .inner_margin(egui::Margin::symmetric(18, 18))
+        self.card_frame(PANEL)
             .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new("Quick Add")
-                        .size(20.0)
-                        .strong()
-                        .color(BRIGHT_TEXT),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "IDM-style link capture with BitTorrent-ready routing for magnet links and .torrent URLs.",
-                    )
-                    .color(MUTED_TEXT),
+                self.section_heading(
+                    ui,
+                    "Quick Add",
+                    "Enter a URL or magnet link, then launch it directly or route it through torrents.",
                 );
                 ui.add_space(10.0);
-                ui.label(egui::RichText::new("File Name").color(MUTED_TEXT));
-                ui.add(egui::TextEdit::singleline(&mut self.new_name).hint_text("ubuntu.iso or movie.torrent"));
-                ui.label(egui::RichText::new("Source URL or Magnet").color(MUTED_TEXT));
-                let source_response = ui.add(
-                    egui::TextEdit::singleline(&mut self.new_source)
-                        .hint_text("https://example.com/file.zip or magnet:?xt=..."),
-                );
-                if source_response.changed() {
+                ui.columns(2, |columns| {
+                    columns[0].label(egui::RichText::new("Source URL or Magnet").color(MUTED_TEXT));
+                    columns[1].label(egui::RichText::new("File Name (optional)").color(MUTED_TEXT));
+                    columns[0].add(
+                        egui::TextEdit::singleline(&mut self.new_source)
+                            .hint_text("Enter URL or Magnet")
+                            .desired_width(f32::INFINITY),
+                    );
+                    columns[1].add(
+                        egui::TextEdit::singleline(&mut self.new_name)
+                            .hint_text("File Name (optional)")
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                if !self.new_source.trim().is_empty() {
                     self.new_kind = infer_download_kind(&self.new_source);
                 }
+                ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.new_kind, DownloadKind::Direct, "Direct");
-                    ui.selectable_value(&mut self.new_kind, DownloadKind::Torrent, "Torrent");
-                    if ui.button("Add To Queue").clicked() {
+                    let button_width = ((ui.available_width() - 12.0) / 2.0).max(160.0);
+                    if ui
+                        .add(
+                            egui::Button::new("Direct Download")
+                                .fill(ACCENT)
+                                .corner_radius(12.0)
+                                .min_size(egui::vec2(button_width, 38.0)),
+                        )
+                        .clicked()
+                    {
+                        self.new_kind = DownloadKind::Direct;
                         self.add_manual_download();
-                    }
-                    if ui.button("Start Direct").clicked() {
                         self.start_next_direct_download();
                     }
-                    if ui.button("Start Torrent").clicked() {
+                    if ui
+                        .add(
+                            egui::Button::new("Torrent Download")
+                                .fill(ACCENT_WARM)
+                                .corner_radius(12.0)
+                                .min_size(egui::vec2(button_width, 38.0)),
+                        )
+                        .clicked()
+                    {
+                        self.new_kind = DownloadKind::Torrent;
+                        self.add_manual_download();
                         self.start_next_torrent_download();
                     }
                 });
                 ui.add_space(10.0);
-                ui.label(egui::RichText::new(format!("Status: {}", self.status_message)).color(ACCENT).strong());
-                ui.label(egui::RichText::new(self.quick_add_hint()).color(ACCENT_WARM).strong());
+                self.card_frame(PANEL_SUBTLE).show(ui, |ui| {
+                    ui.label(egui::RichText::new(format!("Status: {}", self.status_message)).color(ACCENT).strong());
+                    ui.label(egui::RichText::new(self.quick_add_hint()).color(ACCENT_WARM).strong());
+                });
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new("Batch Import").color(MUTED_TEXT));
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.batch_import_sources)
+                        .desired_rows(3)
+                        .desired_width(ui.available_width().max(520.0))
+                        .hint_text("Paste one URL or magnet per line"),
+                );
+                if ui
+                    .add(
+                        egui::Button::new("Import Batch URLs")
+                            .fill(PANEL_HIGHLIGHT)
+                            .corner_radius(12.0),
+                    )
+                    .clicked()
+                {
+                    self.import_batch_downloads();
+                }
                 if self.new_kind == DownloadKind::Direct {
                     let preview_request = shared::DownloadRequest::new(
                         self.new_name.trim().to_owned(),
@@ -826,77 +1290,142 @@ impl DesktopApp {
                 }
             });
     }
-    fn render_browser_capture_confirmation(&mut self, ctx: &egui::Context) {
+    fn render_browser_capture_confirmation_contents(&mut self, ui: &mut egui::Ui) {
         let Some(payload) = self.pending_browser_capture.clone() else {
             return;
         };
 
-        egui::Window::new("Confirm Browser Download")
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .collapsible(false)
-            .resizable(false)
-            .frame(
-                egui::Frame::new()
-                    .fill(PANEL)
-                    .stroke(egui::Stroke::new(1.0, PANEL_HIGHLIGHT))
-                    .corner_radius(18.0)
-                    .inner_margin(egui::Margin::symmetric(18, 18)),
-            )
-            .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new("NebulaDM received a browser download request.")
-                        .color(BRIGHT_TEXT)
-                        .size(20.0)
-                        .strong(),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "Continue this download in NebulaDM, or let the browser keep it?",
-                    )
-                    .color(MUTED_TEXT),
-                );
-                ui.add_space(10.0);
-                ui.label(
-                    egui::RichText::new(format!("File: {}", payload.file_name))
-                        .color(BRIGHT_TEXT)
-                        .strong(),
-                );
-                ui.label(egui::RichText::new(format!("Type: {}", payload.kind)).color(MUTED_TEXT));
-                ui.label(
-                    egui::RichText::new(format!("Source: {}", payload.source)).color(MUTED_TEXT),
-                );
-                if let Some(referrer) = &payload.referrer
-                    && !self.privacy_settings.minimize_browser_metadata_retention()
-                {
-                    ui.label(
-                        egui::RichText::new(format!("Referrer: {referrer}")).color(MUTED_TEXT),
-                    );
-                }
-                ui.add_space(14.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(egui::RichText::new("Download In NebulaDM").strong())
-                                .fill(ACCENT)
-                                .corner_radius(12.0),
-                        )
-                        .clicked()
-                    {
-                        self.accept_pending_browser_capture();
-                    }
+        let preview_request = payload
+            .clone()
+            .into_request()
+            .with_custom_target_folder(Some(self.pending_browser_capture_save_folder.clone()));
+        let preview_plan = plan_download(
+            &preview_request,
+            &self.queue_manager.snapshot().downloads_root,
+            &self.queue_manager.snapshot().categories,
+        );
 
-                    if ui
-                        .add(
-                            egui::Button::new(egui::RichText::new("Dismiss").color(MUTED_TEXT))
-                                .fill(PANEL_ALT)
-                                .corner_radius(12.0),
+        ui.label(
+            egui::RichText::new("NebulaDM received a browser download request.")
+                .color(BRIGHT_TEXT)
+                .size(20.0)
+                .strong(),
+        );
+        ui.label(
+            egui::RichText::new(
+                "Continue this download in NebulaDM, or let the browser keep it?",
+            )
+            .color(MUTED_TEXT),
+        );
+        ui.add_space(10.0);
+        ui.label(
+            egui::RichText::new(format!("File: {}", payload.file_name))
+                .color(BRIGHT_TEXT)
+                .strong(),
+        );
+        ui.label(egui::RichText::new(format!("Type: {}", payload.kind)).color(MUTED_TEXT));
+        ui.label(egui::RichText::new(format!("Source: {}", payload.source)).color(MUTED_TEXT));
+        if let Some(referrer) = &payload.referrer
+            && !self.privacy_settings.minimize_browser_metadata_retention()
+        {
+            ui.label(egui::RichText::new(format!("Referrer: {referrer}")).color(MUTED_TEXT));
+        }
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new("Save To").color(MUTED_TEXT));
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.pending_browser_capture_save_folder)
+                    .desired_width(320.0),
+            );
+            if ui.button("Browse").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_directory(&self.pending_browser_capture_save_folder)
+                    .pick_folder()
+                {
+                    self.pending_browser_capture_save_folder = display_path(&path);
+                }
+            }
+        });
+        ui.label(
+            egui::RichText::new(format!("Planned Target Folder: {}", preview_plan.target_folder))
+                .color(ACCENT_WARM),
+        );
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("Download In NebulaDM").strong())
+                        .fill(ACCENT)
+                        .corner_radius(12.0),
+                )
+                .clicked()
+            {
+                self.accept_pending_browser_capture();
+            }
+
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("Dismiss").color(MUTED_TEXT))
+                        .fill(PANEL_ALT)
+                        .corner_radius(12.0),
+                )
+                .clicked()
+            {
+                self.reject_pending_browser_capture();
+            }
+        });
+    }
+
+    fn render_browser_capture_confirmation_popup(&mut self, ctx: &egui::Context) {
+        let Some(payload) = self.pending_browser_capture.clone() else {
+            return;
+        };
+
+        let viewport_id = ViewportId::from_hash_of("browser-capture-confirmation");
+        let title = format!("Confirm Download: {}", payload.file_name);
+        let builder = egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_inner_size([520.0, 320.0])
+            .with_min_inner_size([480.0, 280.0])
+            .with_always_on_top();
+        let builder = if let Some(icon) = load_app_icon() {
+            builder.with_icon(icon)
+        } else {
+            builder
+        };
+
+        ctx.show_viewport_immediate(viewport_id, builder, |ctx, class| {
+            let render_ui = |ui: &mut egui::Ui, app: &mut Self| {
+                app.render_browser_capture_confirmation_contents(ui);
+            };
+
+            match class {
+                ViewportClass::Embedded => {
+                    egui::Window::new("Confirm Browser Download")
+                        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                        .collapsible(false)
+                        .resizable(false)
+                        .frame(
+                            egui::Frame::new()
+                                .fill(PANEL)
+                                .stroke(egui::Stroke::new(1.0, PANEL_HIGHLIGHT))
+                                .corner_radius(18.0)
+                                .inner_margin(egui::Margin::symmetric(18, 18)),
                         )
-                        .clicked()
-                    {
-                        self.reject_pending_browser_capture();
-                    }
-                });
-            });
+                        .show(ctx, |ui| render_ui(ui, self));
+                }
+                ViewportClass::Immediate => {
+                    egui::CentralPanel::default()
+                        .frame(
+                            egui::Frame::new()
+                                .fill(BACKGROUND)
+                                .inner_margin(egui::Margin::symmetric(18, 18)),
+                        )
+                        .show(ctx, |ui| render_ui(ui, self));
+                }
+                _ => {}
+            }
+        });
     }
 
     fn accept_pending_browser_capture(&mut self) {
@@ -905,11 +1434,16 @@ impl DesktopApp {
         };
 
         let mut request = payload.into_request();
+        let custom_target = self.pending_browser_capture_save_folder.trim().to_owned();
+        if !custom_target.is_empty() {
+            request = request.with_custom_target_folder(Some(custom_target));
+        }
         if self.privacy_settings.minimize_browser_metadata_retention() {
             request.clear_browser_context();
         }
         let id = self.queue_manager.add_download_request(request, true);
         self.selected_view = QueueView::BrowserCapture;
+        self.pending_browser_capture_save_folder = display_path(&resolve_download_root());
         self.status_message = format!("Accepted browser download into job #{id}");
         let _ = save_snapshot(&self.storage_path, self.queue_manager.snapshot());
         self.save_desktop_state();
@@ -917,6 +1451,7 @@ impl DesktopApp {
 
     fn reject_pending_browser_capture(&mut self) {
         if let Some(payload) = self.pending_browser_capture.take() {
+            self.pending_browser_capture_save_folder = display_path(&resolve_download_root());
             self.status_message = format!("Dismissed browser capture for {}", payload.file_name);
         }
     }
@@ -938,6 +1473,133 @@ impl DesktopApp {
         };
         self.save_desktop_state();
         let _ = save_snapshot(&self.storage_path, self.queue_manager.snapshot());
+    }
+
+    fn set_run_on_startup(&mut self, enabled: bool) {
+        self.run_on_startup = enabled;
+        self.status_message = match sync_run_on_startup(enabled) {
+            Some(message) => message,
+            None => {
+                if enabled {
+                    "Run on startup enabled".to_owned()
+                } else {
+                    "Run on startup disabled".to_owned()
+                }
+            }
+        };
+        self.save_desktop_state();
+    }
+
+    #[cfg(windows)]
+    fn init_tray_icon(&mut self) {
+        if self.tray_icon.is_some() {
+            return;
+        }
+
+        let Some(icon) = load_tray_icon() else {
+            self.status_message = "Tray icon could not load the app logo".to_owned();
+            return;
+        };
+
+        let menu = Menu::new();
+        let show_item = MenuItem::new("Open NebulaDM", true, None);
+        let hide_item = MenuItem::new("Hide To Tray", true, None);
+        let pause_item = MenuItem::new("Pause Active", true, None);
+        let resume_item = MenuItem::new("Resume Active", true, None);
+        let recent_item = MenuItem::new("Open Recent Download Folder", true, None);
+        let quit_item = MenuItem::new("Quit", true, None);
+        let _ = menu.append_items(&[
+            &show_item,
+            &hide_item,
+            &pause_item,
+            &resume_item,
+            &recent_item,
+            &PredefinedMenuItem::separator(),
+            &quit_item,
+        ]);
+
+        match TrayIconBuilder::new()
+            .with_icon(icon)
+            .with_tooltip("NebulaDM")
+            .with_menu(Box::new(menu))
+            .with_menu_on_left_click(false)
+            .build()
+        {
+            Ok(tray_icon) => {
+                self.tray_show_id = Some(show_item.id().clone());
+                self.tray_hide_id = Some(hide_item.id().clone());
+                self.tray_pause_id = Some(pause_item.id().clone());
+                self.tray_resume_id = Some(resume_item.id().clone());
+                self.tray_recent_id = Some(recent_item.id().clone());
+                self.tray_quit_id = Some(quit_item.id().clone());
+                self.tray_icon = Some(tray_icon);
+            }
+            Err(err) => {
+                self.status_message = format!("Tray initialization failed: {err}");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn handle_tray_events(&mut self, ctx: &egui::Context) {
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
+            if self.tray_show_id.as_ref() == Some(&event.id) {
+                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(ViewportCommand::Focus);
+                self.start_in_background = false;
+                self.status_message = "NebulaDM restored from the system tray".to_owned();
+            } else if self.tray_hide_id.as_ref() == Some(&event.id) {
+                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+                self.status_message = "NebulaDM is running in the background from the tray".to_owned();
+            } else if self.tray_pause_id.as_ref() == Some(&event.id) {
+                if let Some(id) = self.active_direct_job_id.or(self.active_torrent_job_id) {
+                    self.request_pause_for(id);
+                }
+            } else if self.tray_resume_id.as_ref() == Some(&event.id) {
+                if let Some(id) = self
+                    .queue_manager
+                    .snapshot()
+                    .queue
+                    .iter()
+                    .find(|item| matches!(item.status, DownloadStatus::Paused | DownloadStatus::Queued))
+                    .map(|item| item.id)
+                {
+                    self.request_resume_for(id);
+                }
+            } else if self.tray_recent_id.as_ref() == Some(&event.id) {
+                if let Some(path) = self.recent_download_targets.first() {
+                    let folder = Path::new(path)
+                        .parent()
+                        .unwrap_or_else(|| Path::new(path));
+                    let _ = open_path_in_shell(folder);
+                }
+            } else if self.tray_quit_id.as_ref() == Some(&event.id) {
+                self.quit_requested = true;
+            }
+        }
+
+        if let Some(tray_icon) = &self.tray_icon {
+            let tooltip = if let Some(id) = self.active_direct_job_id {
+                format!("NebulaDM\nDirect job #{id} active")
+            } else if let Some(id) = self.active_torrent_job_id {
+                format!("NebulaDM\nTorrent job #{id} active")
+            } else {
+                "NebulaDM\nIdle in background".to_owned()
+            };
+            let _ = tray_icon.set_tooltip(Some(&tooltip));
+        }
+    }
+
+    #[cfg(windows)]
+    fn handle_root_close_to_tray(&mut self, ctx: &egui::Context) {
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        if !close_requested || self.quit_requested {
+            return;
+        }
+
+        ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        self.status_message = "NebulaDM is still running in the tray".to_owned();
     }
 
     fn has_active_transfers(&self) -> bool {
@@ -1048,6 +1710,216 @@ impl DesktopApp {
         self.save_desktop_state();
     }
 
+    fn import_batch_downloads(&mut self) {
+        let entries: Vec<String> = self
+            .batch_import_sources
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect();
+
+        if entries.is_empty() {
+            self.status_message = "Paste one or more URLs or magnet links to import".to_owned();
+            return;
+        }
+
+        let mut added = 0usize;
+        for source in entries {
+            let kind = infer_download_kind(&source);
+            let file_name = infer_display_name_from_source(&source, kind.clone());
+            self.queue_manager
+                .add_download(file_name, source, kind, false);
+            added += 1;
+        }
+
+        self.batch_import_sources.clear();
+        self.status_message = format!("Imported {added} downloads into the queue");
+        let _ = save_snapshot(&self.storage_path, self.queue_manager.snapshot());
+        self.save_desktop_state();
+    }
+
+    fn poll_clipboard_for_download_links(&mut self) {
+        if !self.clipboard_watch_enabled
+            || self.last_clipboard_poll_at.elapsed() < Duration::from_millis(900)
+        {
+            return;
+        }
+        self.last_clipboard_poll_at = Instant::now();
+
+        let mut clipboard = match Clipboard::new() {
+            Ok(clipboard) => clipboard,
+            Err(_) => return,
+        };
+        let text = match clipboard.get_text() {
+            Ok(text) => text.trim().to_owned(),
+            Err(_) => return,
+        };
+        if text.is_empty() || self.last_clipboard_value.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        self.last_clipboard_value = Some(text.clone());
+        if !looks_like_download_source(&text) {
+            return;
+        }
+
+        self.new_source = text.clone();
+        self.new_kind = infer_download_kind(&text);
+        self.new_name = infer_display_name_from_source(&text, self.new_kind.clone());
+        self.status_message = "Detected a download link from the clipboard".to_owned();
+    }
+
+    fn push_notification(&mut self, title: impl Into<String>, body: impl Into<String>) {
+        let title = title.into();
+        let body = body.into();
+        self.notification_serial += 1;
+        self.notifications.push(AppNotification {
+            id: self.notification_serial,
+            title: title.clone(),
+            body: body.clone(),
+            created_at: Instant::now(),
+        });
+        if self.notifications.len() > 5 {
+            let keep_from = self.notifications.len().saturating_sub(5);
+            self.notifications.drain(0..keep_from);
+        }
+        if self.native_notifications_enabled {
+            let _ = show_native_notification(&title, &body);
+        }
+    }
+
+    fn render_notification_toasts(&mut self, ctx: &egui::Context) {
+        self.notifications
+            .retain(|notification| notification.created_at.elapsed() < Duration::from_secs(6));
+        let Some(notification) = self.notifications.last().cloned() else {
+            return;
+        };
+
+        let viewport_id = ViewportId::from_hash_of(("download-toast", notification.id));
+        let builder = egui::ViewportBuilder::default()
+            .with_title("NebulaDM Notification")
+            .with_inner_size([340.0, 120.0])
+            .with_min_inner_size([320.0, 110.0])
+            .with_position(egui::pos2(1200.0, 680.0))
+            .with_always_on_top()
+            .with_decorations(false)
+            .with_resizable(false);
+
+        ctx.show_viewport_immediate(viewport_id, builder, |ctx, class| match class {
+            ViewportClass::Immediate | ViewportClass::Embedded => {
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::new()
+                            .fill(PANEL)
+                            .stroke(egui::Stroke::new(1.0, PANEL_HIGHLIGHT))
+                            .corner_radius(18.0)
+                            .inner_margin(egui::Margin::symmetric(16, 14)),
+                    )
+                    .show(ctx, |ui| {
+                        ui.label(
+                            egui::RichText::new(&notification.title)
+                                .strong()
+                                .color(BRIGHT_TEXT),
+                        );
+                        ui.label(egui::RichText::new(&notification.body).color(MUTED_TEXT));
+                    });
+            }
+            _ => {}
+        });
+    }
+
+    fn render_setup_center(&mut self, ctx: &egui::Context) {
+        if !self.show_setup_center {
+            return;
+        }
+
+        let mut open = self.show_setup_center;
+        let mut setup_browser_extension = false;
+        let mut register_magnet_links = false;
+        let mut enable_run_on_startup = false;
+        let mut check_for_updates = false;
+        let mut build_installer = false;
+        let mut open_onboarding = false;
+        egui::Window::new("Setup Center")
+            .default_width(560.0)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("Guided Setup")
+                        .size(22.0)
+                        .strong()
+                        .color(BRIGHT_TEXT),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Finish the NebulaDM basics: browser capture, startup, associations, and updates.",
+                    )
+                    .color(MUTED_TEXT),
+                );
+                ui.add_space(12.0);
+                if ui.button("Setup Browser Extension").clicked() {
+                    setup_browser_extension = true;
+                }
+                if ui.button("Register Magnet Links").clicked() {
+                    register_magnet_links = true;
+                }
+                if ui.button("Enable Run On Startup").clicked() {
+                    enable_run_on_startup = true;
+                }
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Update Feed URL").color(MUTED_TEXT));
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.update_feed_url)
+                            .desired_width(ui.available_width())
+                            .hint_text("https://your-domain/releases/windows/update.json"),
+                    )
+                    .changed()
+                {
+                    self.save_desktop_state();
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Check For Updates").clicked() {
+                        check_for_updates = true;
+                    }
+                    if ui.button("Build Windows Installer").clicked() {
+                        build_installer = true;
+                    }
+                    if ui.button("Open Onboarding Guide").clicked() {
+                        open_onboarding = true;
+                    }
+                });
+            });
+        self.show_setup_center = open;
+
+        if setup_browser_extension {
+            self.open_browser_extension_setup();
+        }
+        if register_magnet_links {
+            self.register_magnet_protocol();
+        }
+        if enable_run_on_startup {
+            self.set_run_on_startup(true);
+        }
+        if check_for_updates {
+            self.check_for_updates();
+        }
+        if build_installer {
+            self.build_windows_installer();
+        }
+        if open_onboarding {
+            match write_onboarding_guide_page().and_then(open_in_default_browser) {
+                Ok(()) => {
+                    self.status_message = "Opened the onboarding guide in your browser".to_owned();
+                }
+                Err(err) => {
+                    self.status_message = format!("Could not open onboarding guide: {err}");
+                }
+            }
+        }
+    }
+
     fn quick_add_hint(&self) -> &'static str {
         match self.new_kind {
             DownloadKind::Direct => {
@@ -1061,30 +1933,42 @@ impl DesktopApp {
 
     fn apply_theme(&self, ctx: &egui::Context) {
         let mut style = (*ctx.style()).clone();
-        style.spacing.item_spacing = egui::vec2(10.0, 10.0);
-        style.spacing.button_padding = egui::vec2(12.0, 8.0);
+        style.spacing.item_spacing = egui::vec2(10.0, 12.0);
+        style.spacing.button_padding = egui::vec2(14.0, 10.0);
+        style.spacing.indent = 12.0;
         style.visuals = egui::Visuals::dark();
         style.visuals.override_text_color = Some(BRIGHT_TEXT);
         style.visuals.widgets.noninteractive.bg_fill = PANEL;
         style.visuals.widgets.inactive.bg_fill = PANEL_ALT;
-        style.visuals.widgets.hovered.bg_fill = PANEL_HIGHLIGHT;
-        style.visuals.widgets.active.bg_fill = PANEL_HIGHLIGHT;
-        style.visuals.widgets.open.bg_fill = PANEL_HIGHLIGHT;
+        style.visuals.widgets.hovered.bg_fill = PANEL_ALT.linear_multiply(1.08);
+        style.visuals.widgets.active.bg_fill = PANEL_ALT.linear_multiply(1.12);
+        style.visuals.widgets.open.bg_fill = PANEL_ALT.linear_multiply(1.08);
         style.visuals.window_fill = BACKGROUND;
         style.visuals.panel_fill = BACKGROUND;
         style.visuals.faint_bg_color = PANEL_ALT;
+        style.visuals.extreme_bg_color = PANEL_SUBTLE;
+        style.visuals.code_bg_color = PANEL_SUBTLE;
+        style.visuals.window_stroke = egui::Stroke::new(1.0, OUTLINE);
         style.visuals.hyperlink_color = ACCENT;
         style.visuals.selection.bg_fill = ACCENT.linear_multiply(0.35);
         style.visuals.selection.stroke = egui::Stroke::new(1.0, ACCENT);
-        style.visuals.widgets.inactive.corner_radius = 12.0.into();
-        style.visuals.widgets.hovered.corner_radius = 12.0.into();
-        style.visuals.widgets.active.corner_radius = 12.0.into();
+        style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, OUTLINE);
+        style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, ACCENT.linear_multiply(0.55));
+        style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
+        style.visuals.widgets.noninteractive.weak_bg_fill = PANEL_SUBTLE;
+        style.visuals.widgets.inactive.weak_bg_fill = PANEL_SUBTLE;
+        style.visuals.widgets.hovered.weak_bg_fill = PANEL_ALT;
+        style.visuals.widgets.active.weak_bg_fill = PANEL_ALT;
+        style.visuals.widgets.inactive.corner_radius = 14.0.into();
+        style.visuals.widgets.hovered.corner_radius = 14.0.into();
+        style.visuals.widgets.active.corner_radius = 14.0.into();
+        style.visuals.widgets.open.corner_radius = 14.0.into();
         ctx.set_style(style);
     }
 
     fn pill(&self, ui: &mut egui::Ui, text: &str, tint: egui::Color32) {
         egui::Frame::new()
-            .fill(tint.linear_multiply(0.22))
+            .fill(tint.linear_multiply(0.18))
             .stroke(egui::Stroke::new(1.0, tint))
             .corner_radius(999.0)
             .inner_margin(egui::Margin::symmetric(10, 4))
@@ -1132,29 +2016,76 @@ impl DesktopApp {
             Some(path) => {
                 #[cfg(windows)]
                 {
-                    match std::process::Command::new("explorer").arg(&path).spawn() {
+                    match write_browser_extension_setup_page(&path).and_then(open_in_default_browser)
+                    {
                         Ok(_) => {
-                            self.status_message = format!(
-                                "Opened browser extension folder: {}",
-                                path.display()
-                            );
+                            self.status_message =
+                                "Opened browser extension setup in your default browser"
+                                    .to_owned();
                         }
                         Err(err) => {
-                            self.status_message =
-                                format!("Could not open browser extension folder: {err}");
+                            self.status_message = format!(
+                                "Could not open browser extension setup in your browser: {err}"
+                            );
                         }
                     }
                 }
 
                 #[cfg(not(windows))]
                 {
-                    self.status_message =
-                        format!("Browser extension folder is available at {}", path.display());
+                    self.status_message = format!(
+                        "Browser extension folder is available at {}",
+                        path.display()
+                    );
                 }
             }
             None => {
                 self.status_message =
                     "Browser extension folder was not found near the app or workspace".to_owned();
+            }
+        }
+    }
+
+    fn check_for_updates(&mut self) {
+        let feed_url = self.update_feed_url.trim().to_owned();
+        if feed_url.is_empty() {
+            self.status_message =
+                "Set an update feed URL first so NebulaDM knows where to check".to_owned();
+            return;
+        }
+
+        match fetch_update_manifest(&feed_url).and_then(download_update_installer_if_newer) {
+            Ok(UpdateCheckResult::AlreadyCurrent(version)) => {
+                self.status_message = format!("NebulaDM is already up to date ({version})");
+            }
+            Ok(UpdateCheckResult::InstallerReady { version, installer_path, notes_url }) => {
+                self.status_message = format!("Downloaded NebulaDM {version}. Launching installer...");
+                let _ = open_path_in_shell(&installer_path);
+                if let Some(url) = notes_url {
+                    self.status_message.push_str(&format!(" Release notes: {url}"));
+                }
+                self.push_notification(
+                    "Update ready",
+                    format!("NebulaDM {version} was downloaded and the installer is ready."),
+                );
+            }
+            Err(err) => {
+                self.status_message = format!("Update check failed: {err}");
+            }
+        }
+    }
+
+    fn build_windows_installer(&mut self) {
+        match write_windows_installer_script() {
+            Ok(script_path) => {
+                self.status_message = format!(
+                    "Generated Windows installer script at {}",
+                    script_path.display()
+                );
+                let _ = open_path_in_shell(&script_path);
+            }
+            Err(err) => {
+                self.status_message = format!("Installer generation failed: {err}");
             }
         }
     }
@@ -1355,6 +2286,80 @@ impl DesktopApp {
         self.rqbit_peer_count = 0;
     }
 
+    fn prepare_direct_request_for_start(
+        &mut self,
+        id: u64,
+        record: &DownloadRecord,
+    ) -> Option<DownloadRequest> {
+        let snapshot = self.queue_manager.snapshot().clone();
+        let mut request = record.request.clone();
+
+        if request.kind != DownloadKind::Direct {
+            return Some(request);
+        }
+
+        let mut plan = build_direct_download_plan(&request, &snapshot.downloads_root, &snapshot.categories);
+        let final_path = PathBuf::from(&plan.final_file_path);
+
+        if final_path.exists() {
+            match self.duplicate_strategy {
+                DuplicateStrategy::Overwrite => {
+                    let _ = fs::remove_file(&plan.final_file_path);
+                    let _ = fs::remove_file(&plan.temp_file_path);
+                    let _ = fs::remove_file(&plan.metadata_file_path);
+                }
+                DuplicateStrategy::Skip => {
+                    self.queue_manager.fail(id, "Skipped duplicate file");
+                    self.push_notification(
+                        "Duplicate skipped",
+                        format!("{} already exists on disk", record.request.file_name),
+                    );
+                    self.status_message =
+                        format!("Skipped job #{id} because the target file already exists");
+                    let _ = save_snapshot(&self.storage_path, self.queue_manager.snapshot());
+                    return None;
+                }
+                DuplicateStrategy::Rename => {
+                    let renamed = unique_file_name(&request.file_name, &plan.target.target_folder);
+                    request.file_name = renamed;
+                    if let Some(existing) = self.queue_manager.get_record_mut(id) {
+                        existing.request.file_name = request.file_name.clone();
+                    }
+                    plan = build_direct_download_plan(
+                        &request,
+                        &snapshot.downloads_root,
+                        &snapshot.categories,
+                    );
+                    let _ = plan;
+                }
+            }
+        }
+
+        Some(request)
+    }
+
+    fn remember_recent_download(&mut self, final_file_path: &str) {
+        self.recent_download_targets.retain(|path| path != final_file_path);
+        self.recent_download_targets
+            .insert(0, final_file_path.to_owned());
+        self.recent_download_targets.truncate(5);
+    }
+
+    fn run_post_download_action(&self, final_file_path: &str) {
+        match self.post_download_action {
+            PostDownloadAction::None => {}
+            PostDownloadAction::OpenFile => {
+                let _ = open_path_in_shell(Path::new(final_file_path));
+            }
+            PostDownloadAction::OpenFolder => {
+                let folder = Path::new(final_file_path)
+                    .parent()
+                    .unwrap_or_else(|| Path::new(final_file_path));
+                let _ = open_path_in_shell(folder);
+            }
+        }
+    }
+
     fn start_next_direct_download(&mut self) {
         if self.active_direct_download.is_some() {
             self.status_message = "A direct download worker is already active".to_owned();
@@ -1381,13 +2386,17 @@ impl DesktopApp {
             return;
         };
 
+        let Some(request) = self.prepare_direct_request_for_start(id, &record) else {
+            return;
+        };
+
         let plan = build_direct_download_plan(
-            &record.request,
+            &request,
             &snapshot.downloads_root,
             &snapshot.categories,
         );
         self.queue_manager.resume(id);
-        self.active_direct_download = Some(spawn_direct_download(record.request.clone(), plan));
+        self.active_direct_download = Some(spawn_direct_download(request, plan));
         self.active_direct_job_id = Some(id);
         self.status_message = format!("Started direct job #{id}");
     }
@@ -1399,6 +2408,8 @@ impl DesktopApp {
 
         let mut finished = false;
         let mut scrub_completed_metadata = false;
+        let mut completed_file_path: Option<String> = None;
+        let mut failed_message: Option<String> = None;
         if let Some(active_download) = &self.active_direct_download {
             while let Ok(event) = active_download.events.try_recv() {
                 match event {
@@ -1442,12 +2453,14 @@ impl DesktopApp {
                         );
                         self.queue_manager.mark_completed(job_id);
                         scrub_completed_metadata = true;
+                        completed_file_path = Some(final_file_path.clone());
                         self.status_message =
                             format!("Completed job #{job_id} -> {final_file_path}");
                         finished = true;
                     }
                     DirectDownloadEvent::Failed { message } => {
                         self.queue_manager.fail(job_id, &message);
+                        failed_message = Some(message.clone());
                         self.status_message = format!("Direct job #{job_id} failed: {message}");
                         finished = true;
                     }
@@ -1471,6 +2484,22 @@ impl DesktopApp {
 
         if scrub_completed_metadata {
             self.scrub_completed_direct_metadata(job_id);
+        }
+
+        if let Some(path) = completed_file_path {
+            self.remember_recent_download(&path);
+            self.run_post_download_action(&path);
+            self.push_notification(
+                "Download completed",
+                format!("Direct job #{job_id} finished downloading"),
+            );
+        }
+
+        if let Some(message) = failed_message {
+            self.push_notification(
+                "Download failed",
+                format!("Direct job #{job_id} failed: {message}"),
+            );
         }
 
         if finished {
@@ -1602,7 +2631,13 @@ impl DesktopApp {
 
         for payload in captures {
             if self.pending_browser_capture.is_none() {
+                let preview_plan = plan_download(
+                    &payload.clone().into_request(),
+                    &self.queue_manager.snapshot().downloads_root,
+                    &self.queue_manager.snapshot().categories,
+                );
                 self.pending_browser_capture = Some(payload);
+                self.pending_browser_capture_save_folder = preview_plan.target_folder;
                 self.status_message = "Browser download is waiting for confirmation".to_owned();
             } else {
                 self.status_message =
@@ -1687,6 +2722,10 @@ impl DesktopApp {
         if progress.progress_percent >= 100.0 {
             self.queue_manager.mark_completed(job_id);
             self.scrub_completed_torrent_metadata(job_id);
+            self.push_notification(
+                "Torrent completed",
+                format!("Torrent job #{job_id} finished"),
+            );
             self.status_message = format!("Torrent job #{job_id} completed");
             let _ = save_snapshot(&self.storage_path, self.queue_manager.snapshot());
             self.active_torrent_job_id = None;
@@ -1771,6 +2810,10 @@ impl DesktopApp {
                     RqbitTorrentEvent::Completed => {
                         self.queue_manager.mark_completed(job_id);
                         scrub_completed_metadata = true;
+                        self.push_notification(
+                            "Torrent completed",
+                            format!("Torrent job #{job_id} finished"),
+                        );
                         self.status_message = format!("Torrent job #{job_id} completed via rqbit");
                         finished = true;
                     }
@@ -1790,6 +2833,10 @@ impl DesktopApp {
                     RqbitTorrentEvent::Failed(message) => {
                         self.pending_delete_confirmation_job_id = None;
                         self.queue_manager.fail(job_id, &message);
+                        self.push_notification(
+                            "Torrent failed",
+                            format!("Torrent job #{job_id} failed: {message}"),
+                        );
                         self.status_message =
                             format!("Torrent job #{job_id} failed via rqbit: {message}");
                         finished = true;
@@ -1916,6 +2963,12 @@ impl DesktopApp {
         let state = DesktopPersistedState {
             expanded_details_job_id: self.expanded_details_job_id,
             privacy: self.privacy_settings.clone(),
+            run_on_startup: self.run_on_startup,
+            clipboard_watch_enabled: self.clipboard_watch_enabled,
+            native_notifications_enabled: self.native_notifications_enabled,
+            update_feed_url: self.update_feed_url.clone(),
+            duplicate_strategy: self.duplicate_strategy,
+            post_download_action: self.post_download_action,
             #[cfg(feature = "torrent-rqbit")]
             rqbit: self.active_torrent_job_id.and_then(|queue_job_id| {
                 if self.privacy_settings.minimize_torrent_metadata_retention() {
@@ -1947,6 +3000,15 @@ impl DesktopApp {
     }
 }
 
+enum UpdateCheckResult {
+    AlreadyCurrent(String),
+    InstallerReady {
+        version: String,
+        installer_path: PathBuf,
+        notes_url: Option<String>,
+    },
+}
+
 fn auto_register_magnet_protocol() -> Option<String> {
     #[cfg(windows)]
     {
@@ -1958,6 +3020,26 @@ fn auto_register_magnet_protocol() -> Option<String> {
 
     #[cfg(not(windows))]
     {
+        None
+    }
+}
+
+fn sync_run_on_startup(enabled: bool) -> Option<String> {
+    #[cfg(windows)]
+    {
+        match set_startup_registration(enabled) {
+            Ok(()) => Some(if enabled {
+                "Startup background mode enabled".to_owned()
+            } else {
+                "Startup background mode disabled".to_owned()
+            }),
+            Err(err) => Some(format!("Startup registration failed: {err}")),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = enabled;
         None
     }
 }
@@ -1987,6 +3069,290 @@ fn resolve_browser_extension_dir() -> Option<PathBuf> {
     }
 
     candidates.into_iter().find(|path| path.is_dir())
+}
+
+fn write_browser_extension_setup_page(extension_dir: &Path) -> Result<PathBuf, String> {
+    let app_state_dir = resolve_app_state_dir();
+    fs::create_dir_all(&app_state_dir).map_err(|err| format!("create app state dir failed: {err}"))?;
+
+    let page_path = app_state_dir.join("browser-extension-setup.html");
+    let extension_path = html_escape(&extension_dir.display().to_string());
+    let page = format!(
+        r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>NebulaDM Browser Extension Setup</title>
+    <style>
+      :root {{
+        color-scheme: light;
+        font-family: "Segoe UI", sans-serif;
+      }}
+      body {{
+        margin: 0;
+        background:
+          radial-gradient(circle at top left, #ffe8bf, transparent 36%),
+          linear-gradient(160deg, #f7f2ea, #e7edf4);
+        color: #1f2933;
+      }}
+      main {{
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 32px 20px 56px;
+      }}
+      .card {{
+        background: rgba(255, 255, 255, 0.86);
+        border: 1px solid rgba(17, 94, 89, 0.12);
+        border-radius: 20px;
+        padding: 24px;
+        box-shadow: 0 14px 36px rgba(31, 41, 51, 0.08);
+      }}
+      h1 {{
+        margin: 0 0 8px;
+        font-size: 28px;
+      }}
+      p, li {{
+        line-height: 1.55;
+      }}
+      code {{
+        display: block;
+        margin-top: 10px;
+        padding: 12px 14px;
+        border-radius: 12px;
+        background: #0f1720;
+        color: #d9e2ec;
+        word-break: break-all;
+      }}
+      ol {{
+        padding-left: 20px;
+      }}
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="card">
+        <h1>NebulaDM Browser Extension Setup</h1>
+        <p>Load the NebulaDM browser extension as an unpacked extension in your Chromium-based browser.</p>
+        <ol>
+          <li>Open your browser's extensions page.</li>
+          <li>Turn on Developer mode.</li>
+          <li>Choose <strong>Load unpacked</strong>.</li>
+          <li>Select this folder:</li>
+        </ol>
+        <code>{extension_path}</code>
+        <p>Chrome usually uses <code>chrome://extensions</code> and Edge usually uses <code>edge://extensions</code>.</p>
+      </div>
+    </main>
+  </body>
+</html>"#
+    );
+
+    fs::write(&page_path, page).map_err(|err| format!("write setup page failed: {err}"))?;
+    Ok(page_path)
+}
+
+#[cfg(windows)]
+fn open_in_default_browser(page_path: PathBuf) -> Result<(), String> {
+    open_windows_shell_target(&page_path.display().to_string(), "launch browser")
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn looks_like_download_source(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("ftp://")
+        || lower.starts_with("magnet:")
+}
+
+fn infer_display_name_from_source(source: &str, kind: DownloadKind) -> String {
+    if kind == DownloadKind::Torrent {
+        return infer_magnet_display_name(source).unwrap_or_else(|| "torrent-download.torrent".to_owned());
+    }
+
+    source
+        .split('?')
+        .next()
+        .and_then(|path| path.rsplit('/').next())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("download.bin")
+        .to_owned()
+}
+
+fn unique_file_name(file_name: &str, target_folder: &str) -> String {
+    let path = Path::new(file_name);
+    let stem = path.file_stem().and_then(|value| value.to_str()).unwrap_or("download");
+    let ext = path.extension().and_then(|value| value.to_str());
+    for index in 1..1000 {
+        let candidate = match ext {
+            Some(ext) if !ext.is_empty() => format!("{stem} ({index}).{ext}"),
+            _ => format!("{stem} ({index})"),
+        };
+        if !Path::new(target_folder).join(&candidate).exists() {
+            return candidate;
+        }
+    }
+    file_name.to_owned()
+}
+
+fn write_onboarding_guide_page() -> Result<PathBuf, String> {
+    let app_state_dir = resolve_app_state_dir();
+    fs::create_dir_all(&app_state_dir).map_err(|err| format!("create app state dir failed: {err}"))?;
+    let page_path = app_state_dir.join("onboarding-guide.html");
+    let page = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NebulaDM Onboarding</title>
+<style>body{font-family:"Segoe UI",sans-serif;background:#111114;color:#f4f6fa;margin:0}main{max-width:860px;margin:0 auto;padding:32px 20px}section{background:#212127;border:1px solid #424753;border-radius:18px;padding:24px;box-shadow:0 16px 40px rgba(0,0,0,.28)}h1{margin:0 0 8px}li{margin:10px 0}code{background:#1a1a20;padding:2px 8px;border-radius:8px}</style>
+</head><body><main><section><h1>NebulaDM First-Run Guide</h1><ol><li>Launch NebulaDM and keep it running in the tray for browser handoff.</li><li>Use <strong>Setup Browser Extension</strong> to open the extension onboarding page.</li><li>Use <strong>Register Magnet Links</strong> so magnet links open in NebulaDM.</li><li>Enable <strong>Run on startup in background</strong> if you want IDM-style always-ready behavior.</li><li>Set an <strong>Update Feed URL</strong> in the setup center so NebulaDM can download newer installers automatically.</li><li>Use the generated Inno Setup script in <code>dist\installer\NebulaDM.iss</code> to create a proper Windows installer.</li></ol></section></main></body></html>"#;
+    fs::write(&page_path, page).map_err(|err| format!("write onboarding guide failed: {err}"))?;
+    Ok(page_path)
+}
+
+fn fetch_update_manifest(feed_url: &str) -> Result<UpdateManifest, String> {
+    reqwest::blocking::get(feed_url)
+        .map_err(|err| format!("request failed: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("update feed error: {err}"))?
+        .json::<UpdateManifest>()
+        .map_err(|err| format!("manifest parse failed: {err}"))
+}
+
+fn download_update_installer_if_newer(manifest: UpdateManifest) -> Result<UpdateCheckResult, String> {
+    let current =
+        Version::parse(env!("CARGO_PKG_VERSION")).map_err(|err| format!("current version parse failed: {err}"))?;
+    let available =
+        Version::parse(&manifest.version).map_err(|err| format!("update version parse failed: {err}"))?;
+    if available <= current {
+        return Ok(UpdateCheckResult::AlreadyCurrent(current.to_string()));
+    }
+
+    let updates_dir = resolve_app_state_dir().join("updates");
+    fs::create_dir_all(&updates_dir).map_err(|err| format!("create updates dir failed: {err}"))?;
+    let installer_path = updates_dir.join(format!("NebulaDM-setup-{}.exe", manifest.version));
+    let bytes = reqwest::blocking::get(&manifest.installer_url)
+        .map_err(|err| format!("installer download failed: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("installer response failed: {err}"))?
+        .bytes()
+        .map_err(|err| format!("read installer payload failed: {err}"))?;
+    fs::write(&installer_path, &bytes).map_err(|err| format!("write installer failed: {err}"))?;
+
+    Ok(UpdateCheckResult::InstallerReady {
+        version: manifest.version,
+        installer_path,
+        notes_url: manifest.notes_url,
+    })
+}
+
+fn write_windows_installer_script() -> Result<PathBuf, String> {
+    let repo_root = std::env::current_dir().map_err(|err| format!("current dir failed: {err}"))?;
+    let installer_dir = repo_root.join("dist").join("installer");
+    fs::create_dir_all(&installer_dir).map_err(|err| format!("create installer dir failed: {err}"))?;
+    let iss_path = installer_dir.join("NebulaDM.iss");
+    let content = format!(
+        r#"; Generated by NebulaDM
+[Setup]
+AppName=NebulaDM
+AppVersion={}
+DefaultDirName={{autopf}}\NebulaDM
+DefaultGroupName=NebulaDM
+OutputDir={}
+OutputBaseFilename=NebulaDM-Setup
+Compression=lzma
+SolidCompression=yes
+WizardStyle=modern
+UninstallDisplayIcon={{app}}\NebulaDM.exe
+
+[Files]
+Source: "{}"; DestDir: "{{app}}"; DestName: "NebulaDM.exe"; Flags: ignoreversion
+Source: "{}\*"; DestDir: "{{app}}\browser-extension"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[Icons]
+Name: "{{group}}\NebulaDM"; Filename: "{{app}}\NebulaDM.exe"
+Name: "{{group}}\Uninstall NebulaDM"; Filename: "{{uninstallexe}}"
+
+[Run]
+Filename: "{{app}}\NebulaDM.exe"; Description: "Launch NebulaDM"; Flags: nowait postinstall skipifsilent
+"#,
+        env!("CARGO_PKG_VERSION"),
+        html_escape(&installer_dir.display().to_string()),
+        html_escape(&repo_root.join("target-release-desktop").join("release").join("desktop.exe").display().to_string()),
+        html_escape(&repo_root.join("extensions").join("browser").display().to_string()),
+    );
+    fs::write(&iss_path, content).map_err(|err| format!("write installer script failed: {err}"))?;
+    Ok(iss_path)
+}
+
+fn show_native_notification(title: &str, body: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        Toast::new(Toast::POWERSHELL_APP_ID)
+            .title(title)
+            .text1(body)
+            .sound(Some(Sound::Default))
+            .duration(ToastDuration::Short)
+            .show()
+            .map_err(|err| format!("toast failed: {err}"))
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (title, body);
+        Ok(())
+    }
+}
+
+fn open_path_in_shell(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        open_windows_shell_target(&path.display().to_string(), "launch shell")
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn open_windows_shell_target(target: &str, action_label: &str) -> Result<(), String> {
+    std::process::Command::new("cmd")
+        .args(["/c", "start", "", target])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("{action_label} failed: {err}"))
+}
+
+#[cfg(windows)]
+fn set_startup_registration(enabled: bool) -> Result<(), String> {
+    let exe_path =
+        std::env::current_exe().map_err(|err| format!("current exe lookup failed: {err}"))?;
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let run_key = hkcu
+        .create_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+        .map_err(|err| format!("open startup run key failed: {err}"))?
+        .0;
+
+    if enabled {
+        let command = format!("\"{}\" --background", exe_path.display());
+        run_key
+            .set_value("NebulaDM", &command)
+            .map_err(|err| format!("set startup entry failed: {err}"))?;
+    } else {
+        let _ = run_key.delete_value("NebulaDM");
+    }
+
+    Ok(())
 }
 
 #[cfg(windows)]

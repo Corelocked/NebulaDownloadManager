@@ -23,6 +23,7 @@ pub struct DownloadRequest {
     pub file_name: String,
     pub source: String,
     pub kind: DownloadKind,
+    pub custom_target_folder: Option<String>,
     pub referrer: Option<String>,
     pub user_agent: Option<String>,
     pub cookie_header: Option<String>,
@@ -34,6 +35,7 @@ impl DownloadRequest {
             file_name,
             source,
             kind,
+            custom_target_folder: None,
             referrer: None,
             user_agent: None,
             cookie_header: None,
@@ -63,6 +65,11 @@ impl DownloadRequest {
             self.source = "[magnet redacted]".to_owned();
         }
     }
+
+    pub fn with_custom_target_folder(mut self, target_folder: Option<String>) -> Self {
+        self.custom_target_folder = target_folder;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -86,6 +93,40 @@ pub enum DownloadStatus {
     Paused,
     Completed,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DuplicateStrategy {
+    Rename,
+    Overwrite,
+    Skip,
+}
+
+impl Display for DuplicateStrategy {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rename => write!(f, "Rename"),
+            Self::Overwrite => write!(f, "Overwrite"),
+            Self::Skip => write!(f, "Skip"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PostDownloadAction {
+    None,
+    OpenFile,
+    OpenFolder,
+}
+
+impl Display for PostDownloadAction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "None"),
+            Self::OpenFile => write!(f, "Open File"),
+            Self::OpenFolder => write!(f, "Open Folder"),
+        }
+    }
 }
 
 impl Display for DownloadStatus {
@@ -243,10 +284,16 @@ impl PrivacySettings {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DesktopPersistedState {
     pub expanded_details_job_id: Option<u64>,
     pub privacy: PrivacySettings,
+    pub run_on_startup: bool,
+    pub clipboard_watch_enabled: bool,
+    pub native_notifications_enabled: bool,
+    pub update_feed_url: String,
+    pub duplicate_strategy: DuplicateStrategy,
+    pub post_download_action: PostDownloadAction,
     pub rqbit: Option<RqbitPersistedState>,
 }
 
@@ -283,6 +330,22 @@ impl DesktopPersistedState {
             std::fs::create_dir_all(parent).map_err(|err| format!("create dir failed: {err}"))?;
         }
         std::fs::write(path, serialized).map_err(|err| format!("write failed: {err}"))
+    }
+}
+
+impl Default for DesktopPersistedState {
+    fn default() -> Self {
+        Self {
+            expanded_details_job_id: None,
+            privacy: PrivacySettings::default(),
+            run_on_startup: true,
+            clipboard_watch_enabled: true,
+            native_notifications_enabled: true,
+            update_feed_url: String::new(),
+            duplicate_strategy: DuplicateStrategy::Rename,
+            post_download_action: PostDownloadAction::OpenFolder,
+            rqbit: None,
+        }
     }
 }
 
