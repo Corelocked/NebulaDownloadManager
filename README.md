@@ -41,12 +41,16 @@ To package the real torrent-enabled build too:
 pwsh -File .\scripts\build-release.ps1 -TorrentRqbit
 ```
 
-This produces a timestamped folder like `dist/NebulaDM-win64-default-YYYYMMDD-HHMMSS/` or `dist/NebulaDM-win64-rqbit-YYYYMMDD-HHMMSS/` with:
+This produces a versioned folder like `dist/NebulaDM-win64-default-v0.1.0/` or `dist/NebulaDM-win64-rqbit-v0.1.0/` with:
 
 - `NebulaDM.exe`
 - `browser-extension/`
 - `README.md`
 - `SETUP.txt`
+
+It also creates a portable zip beside the folder, such as:
+
+- `dist/NebulaDM-win64-default-v0.1.0.zip`
 
 ## Build a Windows installer
 
@@ -81,6 +85,30 @@ NebulaDM now supports a manifest-driven update check from the desktop app.
 - If a newer installer is available, NebulaDM downloads it into `%LOCALAPPDATA%\NebulaDM\updates\` and launches it
 
 Use `assets/update-feed.example.json` as the schema reference for your hosted update manifest.
+
+## Prepare a GitHub Release
+
+NebulaDM includes a release-prep script to generate the public assets and updater manifest in one pass.
+
+```powershell
+pwsh -File .\scripts\prepare-github-release.ps1 -Tag v0.1.0 -Repo yourname/NebulaDM
+```
+
+This verifies the tag matches the app version and produces:
+
+- `setup/NebulaDM-Setup.exe`
+- `dist/NebulaDM-win64-default-v0.1.0.zip`
+- `setup/update-feed.json`
+- `setup/RELEASE_NOTES.md`
+
+Recommended GitHub Release flow:
+
+1. Commit your changes.
+2. Create and push a tag like `v0.1.0`.
+3. Run `prepare-github-release.ps1` with that tag and your GitHub repo slug.
+4. Create a GitHub Release for that tag.
+5. Upload `setup/NebulaDM-Setup.exe` and the generated portable zip as release assets.
+6. Host or publish `setup/update-feed.json` so the in-app updater can find the installer URL.
 
 ## Windows storage paths
 

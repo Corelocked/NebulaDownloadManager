@@ -7,8 +7,11 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $distRoot = Join-Path $repoRoot "dist"
 $packageVariant = if ($TorrentRqbit) { "rqbit" } else { "default" }
-$packageName = "NebulaDM-win64-$packageVariant-" + (Get-Date -Format "yyyyMMdd-HHmmss")
+$appVersion = (Get-Content (Join-Path $repoRoot "apps\desktop\Cargo.toml") | Where-Object { $_ -match '^version = ' } | Select-Object -First 1)
+$appVersion = ($appVersion -replace 'version = "', '') -replace '"', ''
+$packageName = "NebulaDM-win64-$packageVariant-v$appVersion"
 $packageRoot = Join-Path $distRoot $packageName
+$portableZipPath = Join-Path $distRoot ($packageName + ".zip")
 $binaryName = "desktop.exe"
 $targetDirName = if ($TorrentRqbit) { "target-release-rqbit-desktop" } else { "target-release-desktop" }
 $releaseBinary = Join-Path $repoRoot "$targetDirName\release\$binaryName"
@@ -18,7 +21,13 @@ $readmeSource = Join-Path $repoRoot "README.md"
 $readmeDest = Join-Path $packageRoot "README.md"
 $setupDest = Join-Path $packageRoot "SETUP.txt"
 
-New-Item -ItemType Directory -Path $packageRoot | Out-Null
+if (Test-Path $packageRoot) {
+    Remove-Item -LiteralPath $packageRoot -Recurse -Force
+}
+if (Test-Path $portableZipPath) {
+    Remove-Item -LiteralPath $portableZipPath -Force
+}
+New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
 
 $cargoArgs = @("build", "-p", "desktop", "--release")
 if ($TorrentRqbit) {
@@ -74,7 +83,10 @@ Build Notes
 "@
 
 Set-Content -LiteralPath $setupDest -Value $setupText
+Compress-Archive -LiteralPath $packageRoot -DestinationPath $portableZipPath
 
 Write-Host ""
 Write-Host "Package ready:"
 Write-Host "  $packageRoot"
+Write-Host "Portable zip:"
+Write-Host "  $portableZipPath"
