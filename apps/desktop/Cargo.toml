@@ -1,0 +1,19 @@
+[package]
+name = "desktop"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+torrent-rqbit = ["download_core/torrent-rqbit"]
+
+[dependencies]
+eframe = "0.33"
+egui = "0.33"
+dirs = "6"
+image = { version = "0.25", default-features = false, features = ["png"] }
+download_core = { path = "../../crates/core" }
+shared = { path = "../../crates/shared" }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"

@@ -1,0 +1,14 @@
+D:\Projects\download-manager\target-release-rqbit-desktop\release\deps\serde-4b2582e48d4d7c88.d: C:\Users\Cedric\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\Cedric\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\Cedric\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\Cedric\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\Cedric\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs D:\Projects\download-manager\target-release-rqbit-desktop\release\build\serde-cf39a1f6442d61c3\out/private.rs
+
+D:\Projects\download-manager\target-release-rqbit-desktop\release\deps\libserde-4b2582e48d4d7c88.rlib: C:\Users\Cedric\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\Cedric\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\Cedric\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\Cedric\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\Cedric\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs D:\Projects\download-manager\target-release-rqbit-desktop\release\build\serde-cf39a1f6442d61c3\out/private.rs
+
+D:\Projects\download-manager\target-release-rqbit-desktop\release\deps\libserde-4b2582e48d4d7c88.rmeta: C:\Users\Cedric\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\Cedric\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\Cedric\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\Cedric\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\Cedric\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs D:\Projects\download-manager\target-release-rqbit-desktop\release\build\serde-cf39a1f6442d61c3\out/private.rs
+
+C:\Users\Cedric\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs:
+C:\Users\Cedric\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs:
+C:\Users\Cedric\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs:
+C:\Users\Cedric\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs:
+C:\Users\Cedric\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs:
+D:\Projects\download-manager\target-release-rqbit-desktop\release\build\serde-cf39a1f6442d61c3\out/private.rs:
+
+# env-dep:OUT_DIR=D:\\Projects\\download-manager\\target-release-rqbit-desktop\\release\\build\\serde-cf39a1f6442d61c3\\out

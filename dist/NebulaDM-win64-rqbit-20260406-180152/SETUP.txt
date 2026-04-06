@@ -1,0 +1,21 @@
+NebulaDM Windows Setup
+======================
+
+1. Launch NebulaDM.exe
+2. In Chrome or Edge, open the extensions page and enable Developer mode
+3. Choose Load unpacked and select:
+   D:\Projects\download-manager\dist\NebulaDM-win64-rqbit-20260406-180152\browser-extension
+4. Keep NebulaDM running while testing browser capture
+
+Storage
+-------
+- Queue state is stored in %LOCALAPPDATA%\NebulaDM when available
+- Downloads default into your Downloads\NebulaDM folder
+
+Bridge
+------
+- Browser extension target: http://127.0.0.1:35791
+
+Build Notes
+-----------
+- This build includes the real torrent engine feature: torrent-rqbit
