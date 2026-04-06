@@ -2051,12 +2051,20 @@ impl DesktopApp {
         if feed_url.is_empty() {
             self.status_message =
                 "Set an update feed URL first so NebulaDM knows where to check".to_owned();
+            self.push_notification(
+                "Update feed missing",
+                "Set an Update Feed URL in Setup Center before checking for updates.",
+            );
             return;
         }
 
         match fetch_update_manifest(&feed_url).and_then(download_update_installer_if_newer) {
             Ok(UpdateCheckResult::AlreadyCurrent(version)) => {
                 self.status_message = format!("NebulaDM is already up to date ({version})");
+                self.push_notification(
+                    "Already up to date",
+                    format!("NebulaDM {version} is already the latest version."),
+                );
             }
             Ok(UpdateCheckResult::InstallerReady { version, installer_path, notes_url }) => {
                 self.status_message = format!("Downloaded NebulaDM {version}. Launching installer...");
@@ -2071,6 +2079,10 @@ impl DesktopApp {
             }
             Err(err) => {
                 self.status_message = format!("Update check failed: {err}");
+                self.push_notification(
+                    "Update check failed",
+                    format!("NebulaDM could not check for updates: {err}"),
+                );
             }
         }
     }
