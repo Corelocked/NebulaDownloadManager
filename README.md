@@ -52,18 +52,23 @@ This produces a timestamped folder like `dist/NebulaDM-win64-default-YYYYMMDD-HH
 
 NebulaDM now includes a real Windows installer packaging path built around Inno Setup.
 
-1. Open the desktop app and use `Setup Center -> Build Windows Installer` to generate `dist/installer/NebulaDM.iss`
-2. Build the release payload:
+1. Build the release payload:
 
 ```powershell
 pwsh -File .\scripts\build-release.ps1
 ```
 
-3. Compile the installer:
+2. Compile the installer:
 
 ```powershell
 pwsh -File .\scripts\build-installer.ps1
 ```
+
+The installer compiler still builds in a temp folder for reliability, but the finished GitHub-ready artifact is always published to:
+
+- `setup/NebulaDM-Setup.exe`
+
+That `setup/` path is the best file to upload as a GitHub Release asset.
 
 If `iscc` is not on your `PATH`, the script will leave the generated `.iss` file in `dist/installer/` and tell you how to compile it manually.
 
@@ -75,7 +80,7 @@ NebulaDM now supports a manifest-driven update check from the desktop app.
 - Click `Check For Updates`
 - If a newer installer is available, NebulaDM downloads it into `%LOCALAPPDATA%\NebulaDM\updates\` and launches it
 
-Use [update-feed.example.json](/d:/Projects/download-manager/assets/update-feed.example.json) as the schema reference for your hosted update manifest.
+Use `assets/update-feed.example.json` as the schema reference for your hosted update manifest.
 
 ## Windows storage paths
 

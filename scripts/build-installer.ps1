@@ -7,6 +7,7 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $releaseScript = Join-Path $PSScriptRoot "build-release.ps1"
 $installerDir = Join-Path $repoRoot "dist\installer"
+$setupDir = Join-Path $repoRoot "setup"
 $installerOutputDir = Join-Path $env:TEMP "NebulaDM-installer-output"
 $issPath = Join-Path $installerDir "NebulaDM.iss"
 $targetDirName = if ($TorrentRqbit) { "target-release-rqbit-desktop" } else { "target-release-desktop" }
@@ -16,6 +17,7 @@ $installerIcon = Join-Path $repoRoot "assets\nebuladm-logo.ico"
 $wizardImage = Join-Path $repoRoot "assets\installer-wizard.bmp"
 $wizardSmallImage = Join-Path $repoRoot "assets\installer-wizard-small.bmp"
 $outputBaseFilename = "NebulaDM-Setup-" + (Get-Date -Format "yyyyMMdd-HHmmss")
+$canonicalInstallerPath = Join-Path $setupDir "NebulaDM-Setup.exe"
 
 Write-Host "Preparing NebulaDM release payload..."
 if ($TorrentRqbit) {
@@ -27,6 +29,7 @@ else {
 
 New-Item -ItemType Directory -Path $installerDir -Force | Out-Null
 New-Item -ItemType Directory -Path $installerOutputDir -Force | Out-Null
+New-Item -ItemType Directory -Path $setupDir -Force | Out-Null
 
 $appVersion = (Get-Content (Join-Path $repoRoot "apps\desktop\Cargo.toml") | Where-Object { $_ -match '^version = ' } | Select-Object -First 1)
 $appVersion = ($appVersion -replace 'version = "', '') -replace '"', ''
@@ -77,6 +80,7 @@ Set-Content -LiteralPath $issPath -Value $issContent
 $iscc = Get-Command "iscc" -ErrorAction SilentlyContinue
 if (-not $iscc) {
     $commonIscc = @(
+        (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"),
         "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
         "C:\Program Files\Inno Setup 6\ISCC.exe"
     ) | Where-Object { Test-Path $_ } | Select-Object -First 1
@@ -95,6 +99,16 @@ if (-not $iscc) {
 Write-Host "Building NebulaDM installer with Inno Setup..."
 & $iscc.Source $issPath
 
+$builtInstallerPath = Join-Path $installerOutputDir ($outputBaseFilename + ".exe")
+if (-not (Test-Path $builtInstallerPath)) {
+    throw "Expected installer output was not found at $builtInstallerPath"
+}
+
+# Keep Inno's output in temp for reliable compilation, then publish a stable
+# setup asset path that is easy to attach to GitHub Releases.
+Copy-Item -LiteralPath $builtInstallerPath -Destination $canonicalInstallerPath -Force
+
 Write-Host ""
 Write-Host "Installer build complete."
-Write-Host "Output: $(Join-Path $installerOutputDir ($outputBaseFilename + '.exe'))"
+Write-Host "GitHub Release asset: $canonicalInstallerPath"
+Write-Host "Build copy: $builtInstallerPath"
