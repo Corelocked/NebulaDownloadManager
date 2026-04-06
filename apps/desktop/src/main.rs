@@ -151,7 +151,39 @@ fn infer_magnet_display_name(magnet_uri: &str) -> Option<String> {
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadTab {
+    Direct,
+    Torrent,
+}
+
+impl DownloadTab {
+    const ALL: [DownloadTab; 2] = [DownloadTab::Direct, DownloadTab::Torrent];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "Direct Downloads",
+            Self::Torrent => "Torrent Downloads",
+        }
+    }
+
+    fn kind(self) -> DownloadKind {
+        match self {
+            Self::Direct => DownloadKind::Direct,
+            Self::Torrent => DownloadKind::Torrent,
+        }
+    }
+
+    fn subtitle(self) -> &'static str {
+        match self {
+            Self::Direct => "Manage HTTP and HTTPS file transfers with resume support and browser handoff.",
+            Self::Torrent => "Manage magnet links and torrent sessions with privacy-aware controls.",
+        }
+    }
+}
+
 struct DesktopApp {
+    selected_tab: DownloadTab,
     queue_manager: QueueManager,
     selected_view: QueueView,
     storage_path: PathBuf,
@@ -204,11 +236,13 @@ impl DesktopApp {
         let mut queue_manager = QueueManager::new(snapshot);
 
         let mut selected_view = QueueView::Active;
+        let mut selected_tab = DownloadTab::Direct;
         let mut status_message = "Snapshot loaded".to_owned();
         let mut pending_launch_start_job_id = None;
         if let Some(request) = launch_request {
             let id = queue_manager.add_download_request(request, false);
             selected_view = QueueView::Torrents;
+            selected_tab = DownloadTab::Torrent;
             status_message = format!("Opened magnet link as job #{id}");
             pending_launch_start_job_id = Some(id);
         }
@@ -222,6 +256,7 @@ impl DesktopApp {
         };
 
         Self {
+            selected_tab,
             queue_manager,
             selected_view,
             storage_path,
@@ -316,7 +351,10 @@ impl eframe::App for DesktopApp {
             .queue
             .iter()
             .cloned()
-            .filter(|item| item.is_visible_in(self.selected_view))
+            .filter(|item| {
+                item.request.kind == self.selected_tab.kind()
+                    && item.is_visible_in(self.selected_view)
+            })
             .collect();
 
         egui::TopBottomPanel::top("top_bar")
@@ -445,6 +483,9 @@ impl eframe::App for DesktopApp {
                 if ui.button(delete_label).clicked() {
                     self.request_delete_history_and_metadata();
                 }
+                if ui.button("Setup Browser Extension").clicked() {
+                    self.open_browser_extension_setup();
+                }
                 if ui.button("Register Magnet Links").clicked() {
                     self.register_magnet_protocol();
                 }
@@ -472,18 +513,40 @@ impl eframe::App for DesktopApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    for tab in DownloadTab::ALL {
+                        let selected = self.selected_tab == tab;
+                        let button = egui::Button::new(
+                            egui::RichText::new(tab.label()).color(if selected {
+                                BRIGHT_TEXT
+                            } else {
+                                MUTED_TEXT
+                            }),
+                        )
+                        .fill(if selected { PANEL_HIGHLIGHT } else { PANEL_ALT })
+                        .corner_radius(14.0)
+                        .min_size(egui::vec2(190.0, 40.0));
+
+                        if ui.add(button).clicked() {
+                            self.selected_tab = tab;
+                            self.new_kind = tab.kind();
+                        }
+                    }
+                });
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(
-                            egui::RichText::new(format!("{} Queue", self.selected_view.label()))
+                            egui::RichText::new(format!(
+                                "{} | {}",
+                                self.selected_tab.label(),
+                                self.selected_view.label()
+                            ))
                                 .size(24.0)
                                 .strong()
                                 .color(BRIGHT_TEXT),
                         );
                         ui.label(
-                            egui::RichText::new(
-                                "Monitor downloads, control torrent sessions, and route files into clean category folders.",
-                            )
-                            .color(MUTED_TEXT),
+                            egui::RichText::new(self.selected_tab.subtitle()).color(MUTED_TEXT),
                         );
                     });
                 });
@@ -504,7 +567,11 @@ impl eframe::App for DesktopApp {
                             .color(BRIGHT_TEXT),
                     );
                     ui.label(
-                        egui::RichText::new("Once the downloader and browser bridge are wired up, matching jobs will appear here.")
+                        egui::RichText::new(format!(
+                            "Matching {} items will appear here when they enter the {} queue.",
+                            self.selected_tab.label().to_ascii_lowercase(),
+                            self.selected_view.label().to_ascii_lowercase()
+                        ))
                             .color(MUTED_TEXT),
                     );
                 });
@@ -1057,6 +1124,38 @@ impl DesktopApp {
         {
             self.status_message =
                 "Magnet protocol registration is currently implemented only for Windows".to_owned();
+        }
+    }
+
+    fn open_browser_extension_setup(&mut self) {
+        match resolve_browser_extension_dir() {
+            Some(path) => {
+                #[cfg(windows)]
+                {
+                    match std::process::Command::new("explorer").arg(&path).spawn() {
+                        Ok(_) => {
+                            self.status_message = format!(
+                                "Opened browser extension folder: {}",
+                                path.display()
+                            );
+                        }
+                        Err(err) => {
+                            self.status_message =
+                                format!("Could not open browser extension folder: {err}");
+                        }
+                    }
+                }
+
+                #[cfg(not(windows))]
+                {
+                    self.status_message =
+                        format!("Browser extension folder is available at {}", path.display());
+                }
+            }
+            None => {
+                self.status_message =
+                    "Browser extension folder was not found near the app or workspace".to_owned();
+            }
         }
     }
 
@@ -1861,6 +1960,33 @@ fn auto_register_magnet_protocol() -> Option<String> {
     {
         None
     }
+}
+
+fn resolve_browser_extension_dir() -> Option<PathBuf> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let current_dir = std::env::current_dir().ok();
+
+    let mut candidates = Vec::new();
+    if let Some(dir) = exe_dir {
+        candidates.push(dir.join("browser-extension"));
+        candidates.push(dir.join("extensions").join("browser"));
+        if let Some(parent) = dir.parent() {
+            candidates.push(parent.join("browser-extension"));
+            candidates.push(parent.join("extensions").join("browser"));
+        }
+        if let Some(grandparent) = dir.parent().and_then(|parent| parent.parent()) {
+            candidates.push(grandparent.join("extensions").join("browser"));
+        }
+    }
+
+    if let Some(dir) = current_dir {
+        candidates.push(dir.join("extensions").join("browser"));
+        candidates.push(dir.join("browser-extension"));
+    }
+
+    candidates.into_iter().find(|path| path.is_dir())
 }
 
 #[cfg(windows)]
