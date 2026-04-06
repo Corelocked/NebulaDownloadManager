@@ -158,20 +158,21 @@ function fetchYouTubeCandidates() {
         const streamingData = playerData?.streamingData || {};
         const formats = Array.isArray(streamingData.formats) ? streamingData.formats : [];
         const adaptiveFormats = Array.isArray(streamingData.adaptiveFormats) ? streamingData.adaptiveFormats : [];
+        const mapCandidate = (item, kind, hasAudio) => ({
+          url: item.url || null,
+          mimeType: item.mimeType || "",
+          kind,
+          hasAudio,
+          qualityLabel: item.qualityLabel || item.quality || "",
+          contentLength: item.contentLength || null,
+          itag: item.itag || null
+        });
         const candidates = formats
-          .map((item) => ({
-            url: item.url || null,
-            mimeType: item.mimeType || "",
-            kind: "youtube-muxed"
-          }))
+          .map((item) => mapCandidate(item, "youtube-muxed", true))
           .concat(
             adaptiveFormats
               .filter((item) => String(item.mimeType || "").startsWith("video/"))
-              .map((item) => ({
-                url: item.url || null,
-                mimeType: item.mimeType || "",
-                kind: "youtube-adaptive-video"
-              }))
+              .map((item) => mapCandidate(item, "youtube-adaptive-video", false))
           )
           .filter((item) => item.url);
         window.postMessage({ type: "${requestId}", candidates }, "*");
@@ -211,6 +212,7 @@ async function buildVideoPayload(video) {
     title: document.title || "Video",
     pageUrl: location.href,
     mimeType: video.getAttribute("type") || "",
+    pageHost: location.hostname,
     candidates: pageCandidates
   };
 }

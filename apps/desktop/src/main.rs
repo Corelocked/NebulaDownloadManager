@@ -287,6 +287,11 @@ fn browser_capture_source_summary(source: &str) -> String {
     truncate_middle(host_or_prefix, 60)
 }
 
+fn requires_browser_context(source: &str) -> bool {
+    let lower = source.trim().to_ascii_lowercase();
+    lower.contains("googlevideo.com") || lower.contains("videoplayback")
+}
+
 fn infer_download_kind(source: &str) -> DownloadKind {
     let normalized = source.trim().to_ascii_lowercase();
     if normalized.starts_with("magnet:") || normalized.ends_with(".torrent") {
@@ -1479,8 +1484,9 @@ impl DesktopApp {
             egui::RichText::new(browser_capture_source_summary(&payload.source)).color(MUTED_TEXT),
         );
         ui.add_space(6.0);
+        let details_max_height = (ui.available_height() - 96.0).clamp(120.0, 240.0);
         egui::ScrollArea::vertical()
-            .max_height(240.0)
+            .max_height(details_max_height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.label(egui::RichText::new(format!("Type: {}", payload.kind)).color(MUTED_TEXT));
@@ -1606,7 +1612,9 @@ impl DesktopApp {
         if !custom_target.is_empty() {
             request = request.with_custom_target_folder(Some(custom_target));
         }
-        if self.privacy_settings.minimize_browser_metadata_retention() {
+        if self.privacy_settings.minimize_browser_metadata_retention()
+            && !requires_browser_context(&request.source)
+        {
             request.clear_browser_context();
         }
         let id = self.queue_manager.add_download_request(request, true);

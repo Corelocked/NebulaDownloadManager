@@ -88,6 +88,17 @@ function isDownloadableVideoUrl(url) {
   return /^https?:/i.test(url || "");
 }
 
+function isLikelyYouTubeVideo(video, tabUrl) {
+  const pageHost = String(video?.pageHost || "");
+  const sourceUrl = String(video?.url || "");
+  const tab = String(tabUrl || video?.pageUrl || "");
+  return (
+    /(^|\.)youtube\.com$/i.test(pageHost) ||
+    /youtube\.com/i.test(tab) ||
+    /googlevideo\.com/i.test(sourceUrl)
+  );
+}
+
 function rememberMediaRequest(details) {
   if (details.tabId < 0 || !isDownloadableVideoUrl(details.url)) {
     return;
@@ -116,6 +127,8 @@ function scoreVideoCandidate(candidate, tabUrl) {
   const lowerUrl = url.toLowerCase();
   const mimeType = (candidate.mimeType || "").toLowerCase();
   const kind = candidate.kind || "";
+  const hasAudio = candidate.hasAudio !== false;
+  const contentLength = Number(candidate.contentLength || 0);
 
   if (!isDownloadableVideoUrl(url)) {
     return -1000;
@@ -135,6 +148,12 @@ function scoreVideoCandidate(candidate, tabUrl) {
     score -= 50;
   }
 
+  if (hasAudio) {
+    score += 45;
+  } else {
+    score -= 80;
+  }
+
   if (lowerUrl.includes("googlevideo.com")) {
     score += 25;
   }
@@ -144,13 +163,19 @@ function scoreVideoCandidate(candidate, tabUrl) {
   }
 
   if (kind === "youtube-muxed") {
-    score += 80;
+    score += 140;
   } else if (kind === "youtube-adaptive-video") {
-    score += 45;
+    score -= 120;
   } else if (kind === "video-element") {
     score += 30;
   } else if (kind === "network-observed") {
     score += 20;
+  }
+
+  if (contentLength > 1024 * 1024) {
+    score += 10;
+  } else if (contentLength > 0 && contentLength < 128 * 1024) {
+    score -= 80;
   }
 
   if (tabUrl && candidate.initiator && tabUrl.startsWith(candidate.initiator)) {
@@ -170,6 +195,8 @@ function pickBestVideoCandidate(video, tabId, tabUrl) {
       url: candidate.url,
       mimeType: candidate.mimeType || "",
       kind: candidate.kind || "video-element",
+      hasAudio: candidate.hasAudio !== false,
+      contentLength: candidate.contentLength || null,
       initiator: tabUrl || "",
       timeStamp: Date.now()
     }));
@@ -179,6 +206,8 @@ function pickBestVideoCandidate(video, tabId, tabUrl) {
       url: video.url,
       mimeType: video.mimeType || "",
       kind: "video-element",
+      hasAudio: true,
+      contentLength: null,
       initiator: tabUrl || "",
       timeStamp: Date.now()
     });
@@ -193,12 +222,26 @@ function pickBestVideoCandidate(video, tabId, tabUrl) {
     return null;
   }
 
-  return combined
+  const ranked = combined
     .map((candidate) => ({
       ...candidate,
       score: scoreVideoCandidate(candidate, tabUrl)
     }))
-    .sort((left, right) => right.score - left.score)[0];
+    .sort((left, right) => right.score - left.score);
+
+  if (isLikelyYouTubeVideo(video, tabUrl)) {
+    const muxedCandidate = ranked.find((candidate) => candidate.kind === "youtube-muxed");
+    if (muxedCandidate) {
+      return muxedCandidate;
+    }
+
+    const safeCandidate = ranked.find(
+      (candidate) => candidate.hasAudio !== false && candidate.score > 0
+    );
+    return safeCandidate || null;
+  }
+
+  return ranked[0];
 }
 
 function inferFileName(item) {
@@ -305,12 +348,17 @@ async function resolveVideoDownload(video, tabId, tabUrl) {
 async function captureVideoFromTab(video, tabId, tabUrl) {
   const settings = await getSettings();
   const resolved = await resolveVideoDownload(video, tabId, tabUrl);
+  const sourceUrl = resolved.source || "";
+  const requiresBrowserContext =
+    /googlevideo\.com/i.test(sourceUrl) || /videoplayback/i.test(sourceUrl);
   const payload = {
     file_name: resolved.file_name,
     source: resolved.source,
     kind: "Direct",
-    referrer: settings.sendReferrer ? resolved.referrer : null,
-    user_agent: settings.sendUserAgent ? navigator.userAgent : null,
+    referrer:
+      settings.sendReferrer || requiresBrowserContext ? resolved.referrer : null,
+    user_agent:
+      settings.sendUserAgent || requiresBrowserContext ? navigator.userAgent : null,
     cookie_header:
       settings.sendCookies && resolved.source.startsWith("http")
         ? await getCookieHeader(resolved.source)
