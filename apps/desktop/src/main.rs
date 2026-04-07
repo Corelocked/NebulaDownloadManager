@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 #[cfg(windows)]
 use std::{ffi::c_void, ptr::null_mut};
@@ -34,8 +35,8 @@ use semver::Version;
 use serde::Deserialize;
 #[cfg(windows)]
 use tray_icon::{
-    Icon as TrayIconImage, TrayIcon, TrayIconBuilder,
-    menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
+    Icon as TrayIconImage, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
+    menu::{Menu, MenuId, MenuItem, PredefinedMenuItem},
 };
 #[cfg(feature = "torrent-rqbit")]
 use shared::RqbitPersistedState;
@@ -69,6 +70,42 @@ const OUTLINE: egui::Color32 = egui::Color32::from_rgb(66, 71, 83);
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(windows)]
 const ERROR_ALREADY_EXISTS: u32 = 183;
+#[cfg(windows)]
+const SW_HIDE: i32 = 0;
+#[cfg(windows)]
+const SW_SHOW: i32 = 5;
+#[cfg(windows)]
+const SW_RESTORE: i32 = 9;
+#[cfg(windows)]
+const WM_CLOSE: u32 = 0x0010;
+
+#[cfg(windows)]
+#[derive(Clone)]
+enum TrayCommand {
+    Show,
+    Hide,
+    PauseActive,
+    ResumeActive,
+    OpenRecent,
+    Quit,
+}
+
+#[cfg(windows)]
+struct TrayRuntime {
+    commands: Mutex<Vec<TrayCommand>>,
+    recent_downloads: Mutex<Vec<String>>,
+}
+
+#[cfg(windows)]
+static TRAY_RUNTIME: OnceLock<TrayRuntime> = OnceLock::new();
+
+#[cfg(windows)]
+fn tray_runtime() -> &'static TrayRuntime {
+    TRAY_RUNTIME.get_or_init(|| TrayRuntime {
+        commands: Mutex::new(Vec::new()),
+        recent_downloads: Mutex::new(Vec::new()),
+    })
+}
 
 fn main() -> eframe::Result<()> {
     #[cfg(windows)]
@@ -165,6 +202,7 @@ fn acquire_single_instance_guard() -> Result<Option<SingleInstanceGuard>, String
 
 #[cfg(windows)]
 unsafe extern "system" {
+    fn FindWindowW(lp_class_name: *const u16, lp_window_name: *const u16) -> *mut c_void;
     fn CreateMutexW(
         lp_mutex_attributes: *mut c_void,
         b_initial_owner: i32,
@@ -172,6 +210,9 @@ unsafe extern "system" {
     ) -> *mut c_void;
     fn GetLastError() -> u32;
     fn CloseHandle(handle: *mut c_void) -> i32;
+    fn ShowWindow(hwnd: *mut c_void, n_cmd_show: i32) -> i32;
+    fn SetForegroundWindow(hwnd: *mut c_void) -> i32;
+    fn PostMessageW(hwnd: *mut c_void, msg: u32, w_param: usize, l_param: isize) -> i32;
 }
 
 #[cfg(windows)]
@@ -180,6 +221,42 @@ fn load_tray_icon() -> Option<TrayIconImage> {
     let image = image::load_from_memory(bytes).ok()?.into_rgba8();
     let (width, height) = image.dimensions();
     TrayIconImage::from_rgba(image.into_raw(), width, height).ok()
+}
+
+#[cfg(windows)]
+fn find_main_window() -> Option<*mut c_void> {
+    let title: Vec<u16> = "NebulaDM".encode_utf16().chain(std::iter::once(0)).collect();
+    let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+    (!hwnd.is_null()).then_some(hwnd)
+}
+
+#[cfg(windows)]
+fn show_main_window_from_tray() {
+    if let Some(hwnd) = find_main_window() {
+        unsafe {
+            ShowWindow(hwnd, SW_RESTORE);
+            ShowWindow(hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn hide_main_window_to_tray() {
+    if let Some(hwnd) = find_main_window() {
+        unsafe {
+            ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn close_main_window_from_tray() {
+    if let Some(hwnd) = find_main_window() {
+        unsafe {
+            let _ = PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+    }
 }
 
 const APP_DIR_NAME: &str = "NebulaDM";
@@ -250,6 +327,11 @@ fn browser_capture_display_name(payload: &BrowserCapturePayload) -> String {
 
 fn normalize_browser_capture_file_name(payload: &BrowserCapturePayload) -> String {
     let raw_name = payload.file_name.trim();
+    let yt_dlp_capture = payload.use_yt_dlp
+        || payload
+            .source_mime_type
+            .as_deref()
+            == Some("application/x-nebula-ytdlp");
     let looks_noisy = raw_name.is_empty()
         || raw_name.len() > 120
         || raw_name.contains('?')
@@ -257,7 +339,7 @@ fn normalize_browser_capture_file_name(payload: &BrowserCapturePayload) -> Strin
         || raw_name.contains("filename%3D")
         || raw_name.contains("response-content");
 
-    let preferred = if looks_noisy {
+    let preferred = if looks_noisy && !yt_dlp_capture {
         infer_display_name_from_source(&payload.source, payload.kind.clone())
     } else {
         raw_name.to_owned()
@@ -677,7 +759,7 @@ impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_theme(ctx);
         #[cfg(windows)]
-        self.handle_tray_events(ctx);
+        self.process_tray_commands(ctx);
         #[cfg(windows)]
         self.handle_root_close_to_tray(ctx);
         self.handle_launch_request_if_needed();
@@ -1605,6 +1687,7 @@ impl DesktopApp {
         let Some(mut payload) = self.pending_browser_capture.take() else {
             return;
         };
+        let should_auto_start = payload.auto_start;
 
         payload.file_name = normalize_browser_capture_file_name(&payload);
         let mut request = payload.into_request();
@@ -1620,7 +1703,15 @@ impl DesktopApp {
         let id = self.queue_manager.add_download_request(request, true);
         self.selected_view = QueueView::BrowserCapture;
         self.pending_browser_capture_save_folder = display_path(&resolve_download_root());
-        self.status_message = format!("Accepted browser download into job #{id}");
+        if should_auto_start && self.active_direct_download.is_none() {
+            self.start_direct_download_for(id);
+            self.status_message = format!("Accepted browser download and started job #{id}");
+        } else if should_auto_start {
+            self.status_message =
+                format!("Accepted browser download into job #{id}. It will start after the active direct download finishes.");
+        } else {
+            self.status_message = format!("Accepted browser download into job #{id}");
+        }
         let _ = save_snapshot(&self.storage_path, self.queue_manager.snapshot());
         self.save_desktop_state();
     }
@@ -1667,6 +1758,23 @@ impl DesktopApp {
     }
 
     #[cfg(windows)]
+    fn show_from_tray(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(ViewportCommand::Focus);
+        self.start_in_background = false;
+        self.status_message = "NebulaDM restored from the system tray".to_owned();
+        ctx.request_repaint();
+    }
+
+    #[cfg(windows)]
+    fn hide_to_tray(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        self.status_message = "NebulaDM is running in the background from the tray".to_owned();
+        ctx.request_repaint();
+    }
+
+    #[cfg(windows)]
     fn init_tray_icon(&mut self) {
         if self.tray_icon.is_some() {
             return;
@@ -1684,6 +1792,12 @@ impl DesktopApp {
         let resume_item = MenuItem::new("Resume Active", true, None);
         let recent_item = MenuItem::new("Open Recent Download Folder", true, None);
         let quit_item = MenuItem::new("Quit", true, None);
+        let show_id = show_item.id().clone();
+        let hide_id = hide_item.id().clone();
+        let pause_id = pause_item.id().clone();
+        let resume_id = resume_item.id().clone();
+        let recent_id = recent_item.id().clone();
+        let quit_id = quit_item.id().clone();
         let _ = menu.append_items(&[
             &show_item,
             &hide_item,
@@ -1702,12 +1816,73 @@ impl DesktopApp {
             .build()
         {
             Ok(tray_icon) => {
-                self.tray_show_id = Some(show_item.id().clone());
-                self.tray_hide_id = Some(hide_item.id().clone());
-                self.tray_pause_id = Some(pause_item.id().clone());
-                self.tray_resume_id = Some(resume_item.id().clone());
-                self.tray_recent_id = Some(recent_item.id().clone());
-                self.tray_quit_id = Some(quit_item.id().clone());
+                let runtime = tray_runtime();
+                tray_icon::TrayIconEvent::set_event_handler(Some(move |event| match event {
+                    TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    }
+                    | TrayIconEvent::DoubleClick {
+                        button: MouseButton::Left,
+                        ..
+                    } => {
+                        show_main_window_from_tray();
+                        if let Ok(mut commands) = runtime.commands.lock() {
+                            commands.push(TrayCommand::Show);
+                        }
+                    }
+                    _ => {}
+                }));
+
+                let runtime = tray_runtime();
+                let menu_show_id = show_id.clone();
+                let menu_hide_id = hide_id.clone();
+                let menu_pause_id = pause_id.clone();
+                let menu_resume_id = resume_id.clone();
+                let menu_recent_id = recent_id.clone();
+                let menu_quit_id = quit_id.clone();
+                tray_icon::menu::MenuEvent::set_event_handler(Some(
+                    move |event: tray_icon::menu::MenuEvent| {
+                    let command = if event.id == menu_show_id {
+                        show_main_window_from_tray();
+                        Some(TrayCommand::Show)
+                    } else if event.id == menu_hide_id {
+                        hide_main_window_to_tray();
+                        Some(TrayCommand::Hide)
+                    } else if event.id == menu_pause_id {
+                        Some(TrayCommand::PauseActive)
+                    } else if event.id == menu_resume_id {
+                        Some(TrayCommand::ResumeActive)
+                    } else if event.id == menu_recent_id {
+                        if let Ok(recent_downloads) = runtime.recent_downloads.lock() {
+                            if let Some(path) = recent_downloads.first() {
+                                let folder =
+                                    Path::new(path).parent().unwrap_or_else(|| Path::new(path));
+                                let _ = open_path_in_shell(folder);
+                            }
+                        }
+                        Some(TrayCommand::OpenRecent)
+                    } else if event.id == menu_quit_id {
+                        close_main_window_from_tray();
+                        Some(TrayCommand::Quit)
+                    } else {
+                        None
+                    };
+
+                    if let Some(command) = command {
+                        if let Ok(mut commands) = runtime.commands.lock() {
+                            commands.push(command);
+                        }
+                    }
+                }));
+
+                self.tray_show_id = Some(show_id);
+                self.tray_hide_id = Some(hide_id);
+                self.tray_pause_id = Some(pause_id);
+                self.tray_resume_id = Some(resume_id);
+                self.tray_recent_id = Some(recent_id);
+                self.tray_quit_id = Some(quit_id);
                 self.tray_icon = Some(tray_icon);
             }
             Err(err) => {
@@ -1717,44 +1892,45 @@ impl DesktopApp {
     }
 
     #[cfg(windows)]
-    fn handle_tray_events(&mut self, ctx: &egui::Context) {
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if self.tray_show_id.as_ref() == Some(&event.id) {
-                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
-                ctx.send_viewport_cmd(ViewportCommand::Focus);
-                self.start_in_background = false;
-                self.status_message = "NebulaDM restored from the system tray".to_owned();
-            } else if self.tray_hide_id.as_ref() == Some(&event.id) {
-                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-                self.status_message = "NebulaDM is running in the background from the tray".to_owned();
-            } else if self.tray_pause_id.as_ref() == Some(&event.id) {
-                if let Some(id) = self.active_direct_job_id.or(self.active_torrent_job_id) {
-                    self.request_pause_for(id);
+    fn process_tray_commands(&mut self, ctx: &egui::Context) {
+        if let Ok(mut commands) = tray_runtime().commands.lock() {
+            let pending = std::mem::take(&mut *commands);
+            drop(commands);
+
+            for command in pending {
+                match command {
+                    TrayCommand::Show => self.show_from_tray(ctx),
+                    TrayCommand::Hide => self.hide_to_tray(ctx),
+                    TrayCommand::PauseActive => {
+                        if let Some(id) = self.active_direct_job_id.or(self.active_torrent_job_id) {
+                            self.request_pause_for(id);
+                        }
+                    }
+                    TrayCommand::ResumeActive => {
+                        if let Some(id) = self
+                            .queue_manager
+                            .snapshot()
+                            .queue
+                            .iter()
+                            .find(|item| {
+                                matches!(item.status, DownloadStatus::Paused | DownloadStatus::Queued)
+                            })
+                            .map(|item| item.id)
+                        {
+                            self.request_resume_for(id);
+                        }
+                    }
+                    TrayCommand::OpenRecent => {
+                        if self.recent_download_targets.is_empty() {
+                            self.status_message = "No recent download folder is available yet".to_owned();
+                        }
+                    }
+                    TrayCommand::Quit => {
+                        self.quit_requested = true;
+                    }
                 }
-            } else if self.tray_resume_id.as_ref() == Some(&event.id) {
-                if let Some(id) = self
-                    .queue_manager
-                    .snapshot()
-                    .queue
-                    .iter()
-                    .find(|item| matches!(item.status, DownloadStatus::Paused | DownloadStatus::Queued))
-                    .map(|item| item.id)
-                {
-                    self.request_resume_for(id);
-                }
-            } else if self.tray_recent_id.as_ref() == Some(&event.id) {
-                if let Some(path) = self.recent_download_targets.first() {
-                    let folder = Path::new(path)
-                        .parent()
-                        .unwrap_or_else(|| Path::new(path));
-                    let _ = open_path_in_shell(folder);
-                }
-            } else if self.tray_quit_id.as_ref() == Some(&event.id) {
-                self.quit_requested = true;
             }
         }
-
         if let Some(tray_icon) = &self.tray_icon {
             let tooltip = if let Some(id) = self.active_direct_job_id {
                 format!("NebulaDM\nDirect job #{id} active")
@@ -1775,7 +1951,7 @@ impl DesktopApp {
         }
 
         ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        self.hide_to_tray(ctx);
         self.status_message = "NebulaDM is still running in the tray".to_owned();
     }
 
@@ -2421,6 +2597,14 @@ impl DesktopApp {
                 cookie_header.split(';').count()
             ));
         }
+        if !record.request.capture_diagnostics.is_empty()
+            && !self.privacy_settings.minimize_browser_metadata_retention()
+        {
+            ui.monospace("Capture Diagnostics:");
+            for line in record.request.capture_diagnostics.iter().take(12) {
+                ui.monospace(format!("  {line}"));
+            }
+        }
 
         if let Some(metadata) = load_resume_metadata(std::path::Path::new(&plan.metadata_file_path))
         {
@@ -2532,6 +2716,10 @@ impl DesktopApp {
         self.recent_download_targets
             .insert(0, final_file_path.to_owned());
         self.recent_download_targets.truncate(5);
+        #[cfg(windows)]
+        if let Ok(mut recent_downloads) = tray_runtime().recent_downloads.lock() {
+            *recent_downloads = self.recent_download_targets.clone();
+        }
     }
 
     fn run_post_download_action(&self, final_file_path: &str) {
@@ -2819,6 +3007,18 @@ impl DesktopApp {
         }
 
         for payload in captures {
+            if payload.auto_start {
+                let preview_plan = plan_download(
+                    &payload.clone().into_request(),
+                    &self.queue_manager.snapshot().downloads_root,
+                    &self.queue_manager.snapshot().categories,
+                );
+                self.pending_browser_capture_save_folder = preview_plan.target_folder;
+                self.pending_browser_capture = Some(payload);
+                self.accept_pending_browser_capture();
+                continue;
+            }
+
             if self.pending_browser_capture.is_none() {
                 let preview_plan = plan_download(
                     &payload.clone().into_request(),
@@ -3446,6 +3646,24 @@ fn write_windows_installer_script() -> Result<PathBuf, String> {
     let installer_dir = repo_root.join("dist").join("installer");
     fs::create_dir_all(&installer_dir).map_err(|err| format!("create installer dir failed: {err}"))?;
     let iss_path = installer_dir.join("NebulaDM.iss");
+    let ffmpeg_bundle = repo_root.join("tools").join("ffmpeg").join("ffmpeg.exe");
+    let ytdlp_bundle = repo_root.join("tools").join("yt-dlp").join("yt-dlp.exe");
+    let ffmpeg_file_entry = if ffmpeg_bundle.is_file() {
+        format!(
+            "Source: \"{}\"; DestDir: \"{{app}}\\tools\"; DestName: \"ffmpeg.exe\"; Flags: ignoreversion\n",
+            html_escape(&ffmpeg_bundle.display().to_string())
+        )
+    } else {
+        String::new()
+    };
+    let ytdlp_file_entry = if ytdlp_bundle.is_file() {
+        format!(
+            "Source: \"{}\"; DestDir: \"{{app}}\\tools\"; DestName: \"yt-dlp.exe\"; Flags: ignoreversion\n",
+            html_escape(&ytdlp_bundle.display().to_string())
+        )
+    } else {
+        String::new()
+    };
     let content = format!(
         r#"; Generated by NebulaDM
 [Setup]
@@ -3463,6 +3681,8 @@ UninstallDisplayIcon={{app}}\NebulaDM.exe
 [Files]
 Source: "{}"; DestDir: "{{app}}"; DestName: "NebulaDM.exe"; Flags: ignoreversion
 Source: "{}\*"; DestDir: "{{app}}\browser-extension"; Flags: ignoreversion recursesubdirs createallsubdirs
+{} 
+{}
 
 [Icons]
 Name: "{{group}}\NebulaDM"; Filename: "{{app}}\NebulaDM.exe"
@@ -3475,6 +3695,8 @@ Filename: "{{app}}\NebulaDM.exe"; Description: "Launch NebulaDM"; Flags: nowait 
         html_escape(&installer_dir.display().to_string()),
         html_escape(&repo_root.join("target-release-desktop").join("release").join("desktop.exe").display().to_string()),
         html_escape(&repo_root.join("extensions").join("browser").display().to_string()),
+        ffmpeg_file_entry,
+        ytdlp_file_entry,
     );
     fs::write(&iss_path, content).map_err(|err| format!("write installer script failed: {err}"))?;
     Ok(iss_path)

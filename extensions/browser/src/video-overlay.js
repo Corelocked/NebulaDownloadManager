@@ -1,11 +1,54 @@
 const OVERLAY_ID = "nebula-video-overlay";
 const STATE_ID = "nebula-video-overlay-state";
+const POSITION_STORAGE_KEY = "nebulaOverlayPosition";
 
 let activeVideo = null;
 let refreshScheduled = false;
 let cachedYouTubeCandidates = [];
 let cachedYouTubeCandidateUrl = "";
 let cachedYouTubeCandidateTime = 0;
+let overlayPosition = null;
+let overlayPositionLoaded = false;
+let dragState = null;
+let lastActionAt = 0;
+
+function clampOverlayPosition(position) {
+  const maxLeft = Math.max(12, window.innerWidth - 222);
+  const maxTop = Math.max(12, window.innerHeight - 140);
+  return {
+    left: Math.min(Math.max(12, Math.round(position.left || 12)), maxLeft),
+    top: Math.min(Math.max(12, Math.round(position.top || 12)), maxTop),
+    pinned: true
+  };
+}
+
+async function loadOverlayPosition() {
+  if (overlayPositionLoaded) {
+    return overlayPosition;
+  }
+
+  overlayPositionLoaded = true;
+  try {
+    const stored = await chrome.storage.local.get(POSITION_STORAGE_KEY);
+    if (stored?.[POSITION_STORAGE_KEY]) {
+      overlayPosition = clampOverlayPosition(stored[POSITION_STORAGE_KEY]);
+    }
+  } catch (error) {
+    console.warn("NebulaDM could not load overlay position", error);
+  }
+
+  return overlayPosition;
+}
+
+function saveOverlayPosition() {
+  if (!overlayPosition?.pinned) {
+    return;
+  }
+
+  chrome.storage.local
+    .set({ [POSITION_STORAGE_KEY]: clampOverlayPosition(overlayPosition) })
+    .catch((error) => console.warn("NebulaDM could not save overlay position", error));
+}
 
 function ensureOverlay() {
   let overlay = document.getElementById(OVERLAY_ID);
@@ -17,7 +60,7 @@ function ensureOverlay() {
   overlay.id = OVERLAY_ID;
   overlay.innerHTML = `
     <div class="nebula-card">
-      <div class="nebula-title">NebulaDM</div>
+      <div class="nebula-title" data-drag-handle="true">NebulaDM</div>
       <div class="nebula-actions">
         <button type="button" data-action="download">Download</button>
         <button type="button" data-action="queue" class="secondary">Queue Only</button>
@@ -52,6 +95,9 @@ function ensureOverlay() {
       letter-spacing: 0.06em;
       text-transform: uppercase;
       color: #7dd3fc;
+      cursor: move;
+      user-select: none;
+      touch-action: none;
       margin-bottom: 6px;
     }
     #${OVERLAY_ID} .nebula-actions {
@@ -86,12 +132,18 @@ function ensureOverlay() {
 
   overlay.addEventListener("click", async (event) => {
     const button = event.target.closest("button[data-action]");
-    if (!button || !activeVideo) {
+    const state = document.getElementById(STATE_ID);
+    if (!button) {
+      return;
+    }
+
+    if (!activeVideo) {
+      state.textContent = "No active video payload is ready yet. Reload the page and try again.";
       return;
     }
 
     const action = button.getAttribute("data-action");
-    const state = document.getElementById(STATE_ID);
+    lastActionAt = Date.now();
     state.textContent =
       action === "download" ? "Starting NebulaDM handoff..." : "Queueing without interrupting playback...";
 
@@ -102,11 +154,60 @@ function ensureOverlay() {
         tabUrl: activeVideo.pageUrl,
         video: activeVideo
       });
+      if (!response) {
+        state.textContent = "No response from extension background worker. Reload the extension and this page.";
+        return;
+      }
       state.textContent = response.ok ? response.message : `Failed: ${response.error}`;
     } catch (error) {
       state.textContent = `Failed: ${error}`;
     }
   });
+
+  overlay.addEventListener("pointerdown", (event) => {
+    const handle = event.target.closest("[data-drag-handle]");
+    if (!handle) {
+      return;
+    }
+
+    dragState = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originLeft: overlayPosition?.left ?? (parseFloat(overlay.style.left) || 12),
+      originTop: overlayPosition?.top ?? (parseFloat(overlay.style.top) || 12)
+    };
+    overlay.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  });
+
+  overlay.addEventListener("pointermove", (event) => {
+    if (!dragState || dragState.pointerId !== event.pointerId) {
+      return;
+    }
+
+    overlayPosition = clampOverlayPosition({
+      left: dragState.originLeft + (event.clientX - dragState.startX),
+      top: dragState.originTop + (event.clientY - dragState.startY)
+    });
+    overlay.style.left = `${overlayPosition.left}px`;
+    overlay.style.top = `${overlayPosition.top}px`;
+  });
+
+  const stopDragging = (event) => {
+    if (!dragState || dragState.pointerId !== event.pointerId) {
+      return;
+    }
+
+    if (overlay.hasPointerCapture(event.pointerId)) {
+      overlay.releasePointerCapture(event.pointerId);
+    }
+    dragState = null;
+    saveOverlayPosition();
+  };
+
+  overlay.addEventListener("pointerup", stopDragging);
+  overlay.addEventListener("pointercancel", stopDragging);
 
   return overlay;
 }
@@ -135,57 +236,98 @@ function fetchYouTubeCandidates() {
     return Promise.resolve([]);
   }
 
-  return new Promise((resolve) => {
-    const requestId = `nebula-yt-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const onMessage = (event) => {
-      if (event.source !== window || event.data?.type !== requestId) {
-        return;
+  const playerSources = [];
+  const scripts = Array.from(document.scripts);
+  const playerPatterns = [
+    /ytInitialPlayerResponse\s*=\s*(\{.+?\})\s*;\s*(?:var\s+meta|var\s+playerResponse|<\/script>)/s,
+    /["']PLAYER_VARS["']\s*:\s*(\{.+?\})\s*,\s*["']PLAYER_JS_URL["']/s,
+    /["']player_response["']\s*:\s*"(.+?)"/s
+  ];
+
+  for (const script of scripts) {
+    const text = script.textContent || "";
+    if (!text.includes("ytInitialPlayerResponse") && !text.includes("player_response")) {
+      continue;
+    }
+
+    for (const pattern of playerPatterns) {
+      const match = text.match(pattern);
+      if (match?.[1]) {
+        playerSources.push(match[1]);
       }
+    }
+  }
 
-      window.removeEventListener("message", onMessage);
-      resolve(Array.isArray(event.data.candidates) ? event.data.candidates : []);
-    };
+  const decodePlayerSource = (value) => {
+    if (!value) {
+      return null;
+    }
 
-    window.addEventListener("message", onMessage);
-    const script = document.createElement("script");
-    script.textContent = `
-      (() => {
-        const response = window.ytInitialPlayerResponse || window.ytplayer?.config?.args?.player_response;
-        let playerData = response;
-        if (typeof playerData === "string") {
-          try { playerData = JSON.parse(playerData); } catch (_error) {}
+    let parsed = value;
+    if (typeof parsed === "string") {
+      try {
+        parsed = JSON.parse(parsed);
+      } catch (_error) {
+        try {
+          parsed = JSON.parse(parsed.replace(/\\"/g, '"').replace(/\\\\/g, "\\"));
+        } catch (_secondError) {
+          return null;
         }
-        const streamingData = playerData?.streamingData || {};
-        const formats = Array.isArray(streamingData.formats) ? streamingData.formats : [];
-        const adaptiveFormats = Array.isArray(streamingData.adaptiveFormats) ? streamingData.adaptiveFormats : [];
-        const mapCandidate = (item, kind, hasAudio) => ({
-          url: item.url || null,
-          mimeType: item.mimeType || "",
-          kind,
-          hasAudio,
-          qualityLabel: item.qualityLabel || item.quality || "",
-          contentLength: item.contentLength || null,
-          itag: item.itag || null
-        });
-        const candidates = formats
-          .map((item) => mapCandidate(item, "youtube-muxed", true))
-          .concat(
-            adaptiveFormats
-              .filter((item) => String(item.mimeType || "").startsWith("video/"))
-              .map((item) => mapCandidate(item, "youtube-adaptive-video", false))
-          )
-          .filter((item) => item.url);
-        window.postMessage({ type: "${requestId}", candidates }, "*");
-      })();
-    `;
-    (document.head || document.documentElement).appendChild(script);
-    script.remove();
+      }
+    }
 
-    window.setTimeout(() => {
-      window.removeEventListener("message", onMessage);
-      resolve([]);
-    }, 700);
+    if (parsed?.streamingData) {
+      return parsed;
+    }
+
+    if (parsed?.player_response) {
+      return decodePlayerSource(parsed.player_response);
+    }
+
+    return null;
+  };
+
+    const mapCandidate = (item, kind, hasAudio) => ({
+      url: item.url || null,
+      mimeType: item.mimeType || "",
+      kind,
+    hasAudio,
+    qualityLabel: item.qualityLabel || item.quality || "",
+    contentLength: item.contentLength || null,
+    itag: item.itag || null
   });
+
+  const parsedPlayers = playerSources
+    .map(decodePlayerSource)
+    .filter((player) => player?.streamingData);
+
+  const candidateMap = new Map();
+  for (const playerData of parsedPlayers) {
+    const streamingData = playerData.streamingData || {};
+    const formats = Array.isArray(streamingData.formats) ? streamingData.formats : [];
+    const adaptiveFormats = Array.isArray(streamingData.adaptiveFormats) ? streamingData.adaptiveFormats : [];
+    for (const item of formats.map((entry) => mapCandidate(entry, "youtube-muxed", true))) {
+      if (item.url) {
+        candidateMap.set(item.url, item);
+      }
+    }
+    for (const item of adaptiveFormats
+      .filter((entry) => String(entry.mimeType || "").startsWith("video/"))
+      .map((entry) => mapCandidate(entry, "youtube-adaptive-video", false))) {
+      if (item.url && !candidateMap.has(item.url)) {
+        candidateMap.set(item.url, item);
+      }
+    }
+    for (const item of adaptiveFormats
+      .filter((entry) => String(entry.mimeType || "").startsWith("audio/"))
+      .map((entry) => mapCandidate(entry, "youtube-adaptive-audio", true))) {
+      if (item.url && !candidateMap.has(item.url)) {
+        candidateMap.set(item.url, item);
+      }
+    }
+  }
+
+  return Promise.resolve(Array.from(candidateMap.values()));
 }
 
 async function buildVideoPayload(video) {
@@ -219,10 +361,16 @@ async function buildVideoPayload(video) {
 
 function positionOverlay(video) {
   const overlay = ensureOverlay();
-  const rect = video.getBoundingClientRect();
-  const overlayWidth = 210;
-  overlay.style.left = `${Math.max(12, rect.right - overlayWidth - 10)}px`;
-  overlay.style.top = `${Math.max(12, rect.top + 12)}px`;
+  if (overlayPosition?.pinned) {
+    const position = clampOverlayPosition(overlayPosition);
+    overlay.style.left = `${position.left}px`;
+    overlay.style.top = `${position.top}px`;
+  } else {
+    const rect = video.getBoundingClientRect();
+    const overlayWidth = 210;
+    overlay.style.left = `${Math.max(12, rect.right - overlayWidth - 10)}px`;
+    overlay.style.top = `${Math.max(12, rect.top + 12)}px`;
+  }
   overlay.style.display = "block";
 }
 
@@ -262,7 +410,10 @@ async function refreshOverlay() {
     ...payload,
     pageUrl: location.href
   };
-  document.getElementById(STATE_ID).textContent = "Download takes over. Queue keeps playback here.";
+  const state = document.getElementById(STATE_ID);
+  if (Date.now() - lastActionAt > 1500) {
+    state.textContent = "Download takes over. Queue keeps playback here.";
+  }
 }
 
 function scheduleRefresh() {
@@ -291,4 +442,4 @@ new MutationObserver(scheduleRefresh).observe(document.documentElement, {
 window.addEventListener("scroll", scheduleRefresh, true);
 window.addEventListener("resize", scheduleRefresh);
 window.setInterval(scheduleRefresh, 1500);
-scheduleRefresh();
+loadOverlayPosition().finally(scheduleRefresh);

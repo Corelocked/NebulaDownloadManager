@@ -13,6 +13,8 @@ $issPath = Join-Path $installerDir "NebulaDM.iss"
 $targetDirName = if ($TorrentRqbit) { "target-release-rqbit-desktop" } else { "target-release-desktop" }
 $releaseBinary = Join-Path $repoRoot "$targetDirName\release\desktop.exe"
 $extensionSource = Join-Path $repoRoot "extensions\browser"
+$ffmpegBundleSource = Join-Path $repoRoot "tools\ffmpeg\ffmpeg.exe"
+$ytDlpBundleSource = Join-Path $repoRoot "tools\yt-dlp\yt-dlp.exe"
 $installerIcon = Join-Path $repoRoot "assets\nebuladm-logo.ico"
 $wizardImage = Join-Path $repoRoot "assets\installer-wizard.bmp"
 $wizardSmallImage = Join-Path $repoRoot "assets\installer-wizard-small.bmp"
@@ -84,6 +86,13 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 Filename: "{app}\NebulaDM.exe"; Description: "Launch NebulaDM"; Flags: nowait postinstall skipifsilent
 Filename: "{app}\browser-extension"; Description: "Open browser extension folder"; Flags: shellexec postinstall unchecked skipifsilent
 "@
+
+if (Test-Path $ffmpegBundleSource) {
+    $issContent = $issContent -replace '(?ms)\[Files\]\r?\n', "[Files]`r`nSource: `"$ffmpegBundleSource`"; DestDir: `"{app}\tools`"; DestName: `"ffmpeg.exe`"; Flags: ignoreversion`r`n"
+}
+if (Test-Path $ytDlpBundleSource) {
+    $issContent = $issContent -replace '(?ms)\[Files\]\r?\n', "[Files]`r`nSource: `"$ytDlpBundleSource`"; DestDir: `"{app}\tools`"; DestName: `"yt-dlp.exe`"; Flags: ignoreversion`r`n"
+}
 
 Set-Content -LiteralPath $issPath -Value $issContent
 

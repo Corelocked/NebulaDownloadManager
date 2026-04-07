@@ -17,6 +17,10 @@ $targetDirName = if ($TorrentRqbit) { "target-release-rqbit-desktop" } else { "t
 $releaseBinary = Join-Path $repoRoot "$targetDirName\release\$binaryName"
 $extensionSource = Join-Path $repoRoot "extensions\browser"
 $extensionDest = Join-Path $packageRoot "browser-extension"
+$ffmpegBundleSource = Join-Path $repoRoot "tools\ffmpeg\ffmpeg.exe"
+$ffmpegBundleDest = Join-Path $packageRoot "tools\ffmpeg.exe"
+$ytDlpBundleSource = Join-Path $repoRoot "tools\yt-dlp\yt-dlp.exe"
+$ytDlpBundleDest = Join-Path $packageRoot "tools\yt-dlp.exe"
 $readmeSource = Join-Path $repoRoot "README.md"
 $readmeDest = Join-Path $packageRoot "README.md"
 $setupDest = Join-Path $packageRoot "SETUP.txt"
@@ -53,6 +57,14 @@ if (-not (Test-Path $releaseBinary)) {
 Copy-Item -LiteralPath $releaseBinary -Destination (Join-Path $packageRoot "NebulaDM.exe")
 Copy-Item -LiteralPath $readmeSource -Destination $readmeDest
 Copy-Item -LiteralPath $extensionSource -Destination $extensionDest -Recurse
+if (Test-Path $ffmpegBundleSource) {
+    New-Item -ItemType Directory -Path (Split-Path -Parent $ffmpegBundleDest) -Force | Out-Null
+    Copy-Item -LiteralPath $ffmpegBundleSource -Destination $ffmpegBundleDest -Force
+}
+if (Test-Path $ytDlpBundleSource) {
+    New-Item -ItemType Directory -Path (Split-Path -Parent $ytDlpBundleDest) -Force | Out-Null
+    Copy-Item -LiteralPath $ytDlpBundleSource -Destination $ytDlpBundleDest -Force
+}
 
 $featureLine = if ($TorrentRqbit) {
     "This build includes the real torrent engine feature: torrent-rqbit"
@@ -83,6 +95,8 @@ Bridge
 Build Notes
 -----------
 - $featureLine
+- If present, a bundled ffmpeg binary is placed in tools\ffmpeg.exe for adaptive browser video merging
+- If present, a bundled yt-dlp binary is placed in tools\yt-dlp.exe for reliable YouTube downloads
 "@
 
 Set-Content -LiteralPath $setupDest -Value $setupText

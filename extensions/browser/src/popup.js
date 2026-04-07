@@ -3,6 +3,7 @@ const captureEnabledInput = document.getElementById("captureEnabled");
 const sendReferrerInput = document.getElementById("sendReferrer");
 const sendUserAgentInput = document.getElementById("sendUserAgent");
 const sendCookiesInput = document.getElementById("sendCookies");
+const enableCookiesButton = document.getElementById("enableCookiesButton");
 const videoPanel = document.getElementById("videoPanel");
 const videoTitle = document.getElementById("videoTitle");
 const videoSource = document.getElementById("videoSource");
@@ -13,6 +14,19 @@ const statusText = document.getElementById("statusText");
 
 let detectedVideo = null;
 let activeTab = null;
+
+const YT_DLP_SITE_PATTERNS = [
+  /(^|\.)youtube\.com$/i,
+  /(^|\.)youtu\.be$/i,
+  /(^|\.)facebook\.com$/i,
+  /(^|\.)fb\.watch$/i,
+  /(^|\.)instagram\.com$/i,
+  /(^|\.)tiktok\.com$/i,
+  /(^|\.)twitter\.com$/i,
+  /(^|\.)x\.com$/i,
+  /(^|\.)vimeo\.com$/i,
+  /(^|\.)dailymotion\.com$/i
+];
 
 function setStatus(message) {
   statusText.textContent = message;
@@ -30,6 +44,40 @@ function truncateMiddle(value, maxLength = 88) {
 
 function inferVideoLabel(video) {
   return video?.title || video?.fileName || "Detected video";
+}
+
+function shouldPreferYtDlpForUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return YT_DLP_SITE_PATTERNS.some((pattern) => pattern.test(parsed.hostname) || pattern.test(url));
+  } catch (_error) {
+    return false;
+  }
+}
+
+function normalizeDetectedVideo(video, tab) {
+  if (!video) {
+    return null;
+  }
+
+  const normalized = {
+    ...video,
+    pageUrl: video.pageUrl || tab?.url || "",
+    pageHost: video.pageHost || (() => {
+      try {
+        return new URL(video.pageUrl || tab?.url || "").hostname;
+      } catch (_error) {
+        return "";
+      }
+    })()
+  };
+
+  if (shouldPreferYtDlpForUrl(normalized.pageUrl || normalized.url || "")) {
+    normalized.useYtDlp = true;
+    normalized.url = normalized.pageUrl || normalized.url;
+  }
+
+  return normalized;
 }
 
 function renderVideoPanel(video) {
@@ -55,9 +103,111 @@ async function detectVideoInActiveTab() {
     return;
   }
 
-  const [result] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
+  const frameResults = await chrome.scripting.executeScript({
+    target: { tabId: tab.id, allFrames: true },
     func: () => {
+      const isYouTube = /(^|\.)youtube\.com$/i.test(location.hostname);
+      const mapCandidate = (item, kind, hasAudio) => ({
+        url: item.url || null,
+        mimeType: item.mimeType || "",
+        kind,
+        hasAudio,
+        qualityLabel: item.qualityLabel || item.quality || "",
+        contentLength: item.contentLength || null,
+        itag: item.itag || null
+      });
+
+      const fetchYouTubeCandidates = () => {
+        const playerSources = [];
+        const playerPatterns = [
+          /ytInitialPlayerResponse\s*=\s*(\{.+?\})\s*;\s*(?:var\s+meta|var\s+playerResponse|<\/script>)/s,
+          /["']PLAYER_VARS["']\s*:\s*(\{.+?\})\s*,\s*["']PLAYER_JS_URL["']/s,
+          /["']player_response["']\s*:\s*"(.+?)"/s
+        ];
+
+        for (const script of Array.from(document.scripts)) {
+          const text = script.textContent || "";
+          if (!text.includes("ytInitialPlayerResponse") && !text.includes("player_response")) {
+            continue;
+          }
+
+          for (const pattern of playerPatterns) {
+            const match = text.match(pattern);
+            if (match?.[1]) {
+              playerSources.push(match[1]);
+            }
+          }
+        }
+
+        const decodePlayerSource = (value) => {
+          if (!value) {
+            return null;
+          }
+          let parsed = value;
+          if (typeof parsed === "string") {
+            try {
+              parsed = JSON.parse(parsed);
+            } catch (_error) {
+              try {
+                parsed = JSON.parse(parsed.replace(/\\"/g, '"').replace(/\\\\/g, "\\"));
+              } catch (_ignored) {
+                return null;
+              }
+            }
+          }
+          if (parsed?.streamingData) {
+            return parsed;
+          }
+          if (parsed?.player_response) {
+            return decodePlayerSource(parsed.player_response);
+          }
+          return null;
+        };
+
+        const candidateMap = new Map();
+        for (const playerData of playerSources.map(decodePlayerSource).filter(Boolean)) {
+          const streamingData = playerData.streamingData || {};
+          const formats = Array.isArray(streamingData.formats) ? streamingData.formats : [];
+          const adaptiveFormats = Array.isArray(streamingData.adaptiveFormats)
+            ? streamingData.adaptiveFormats
+            : [];
+          for (const item of formats.map((entry) => mapCandidate(entry, "youtube-muxed", true))) {
+            if (item.url) {
+              candidateMap.set(item.url, item);
+            }
+          }
+          for (const item of adaptiveFormats
+            .filter((entry) => String(entry.mimeType || "").startsWith("video/"))
+            .map((entry) => mapCandidate(entry, "youtube-adaptive-video", false))) {
+            if (item.url && !candidateMap.has(item.url)) {
+              candidateMap.set(item.url, item);
+            }
+          }
+          for (const item of adaptiveFormats
+            .filter((entry) => String(entry.mimeType || "").startsWith("audio/"))
+            .map((entry) => mapCandidate(entry, "youtube-adaptive-audio", true))) {
+            if (item.url && !candidateMap.has(item.url)) {
+              candidateMap.set(item.url, item);
+            }
+          }
+        }
+        return Array.from(candidateMap.values());
+      };
+
+      if (isYouTube) {
+        const candidates = fetchYouTubeCandidates();
+        return {
+          url: window.location.href,
+          fileName: "",
+          title: document.title || "YouTube Video",
+          pageUrl: window.location.href,
+          pageHost: window.location.hostname,
+          poster: null,
+          candidates,
+          useYtDlp: true
+        };
+      }
+
       const videos = Array.from(document.querySelectorAll("video"));
       const ranked = videos
         .map((video) => {
@@ -90,17 +240,83 @@ async function detectVideoInActiveTab() {
         fileName,
         title: document.title || fileName || "Video",
         pageUrl: window.location.href,
+        pageHost: window.location.hostname,
         poster: best.poster || null,
-        candidates: []
+        candidates: [],
+        useYtDlp: false
       };
     }
   });
 
-  renderVideoPanel(result?.result || null);
-  if (result?.result?.url) {
-    setStatus("Video detected. Download hands it off to NebulaDM, while Queue Only keeps playback in the browser.");
+  const scriptCandidates = frameResults
+    .map((entry) => entry?.result || null)
+    .filter(Boolean)
+    .map((entry) => normalizeDetectedVideo(entry, tab));
+  const rankedCandidates = scriptCandidates.sort((left, right) => {
+    const leftScore = Number(Boolean(left?.useYtDlp)) * 100 + Number((left?.candidates || []).length > 0);
+    const rightScore = Number(Boolean(right?.useYtDlp)) * 100 + Number((right?.candidates || []).length > 0);
+    return rightScore - leftScore;
+  });
+
+  let selectedVideo = rankedCandidates[0] || null;
+
+  if (!selectedVideo) {
+    const response = await chrome.runtime.sendMessage({
+      type: "nebula:get-media-candidates",
+      tabId: tab.id
+    });
+    const observedCandidates = Array.isArray(response?.candidates) ? response.candidates : [];
+    const bestObserved = observedCandidates.find((candidate) => /^https?:/i.test(candidate?.url || ""));
+    if (bestObserved) {
+      selectedVideo = normalizeDetectedVideo(
+        {
+          url: bestObserved.url,
+          fileName: bestObserved.url.split("/").pop()?.split("?")[0] || "",
+          title: tab.title || "Detected video",
+          pageUrl: tab.url,
+          pageHost: (() => {
+            try {
+              return new URL(tab.url).hostname;
+            } catch (_error) {
+              return "";
+            }
+          })(),
+          poster: null,
+          candidates: observedCandidates,
+          useYtDlp: shouldPreferYtDlpForUrl(tab.url)
+        },
+        tab
+      );
+    }
+  }
+
+  renderVideoPanel(selectedVideo);
+  if (selectedVideo?.url) {
+    setStatus("Video detected. Download sends it straight to NebulaDM, while Queue Only saves it to NebulaDM without interrupting playback.");
+  } else if (shouldPreferYtDlpForUrl(tab.url)) {
+    const fallbackVideo = normalizeDetectedVideo(
+      {
+        url: tab.url,
+        fileName: "",
+        title: tab.title || "Detected video",
+        pageUrl: tab.url,
+        pageHost: (() => {
+          try {
+            return new URL(tab.url).hostname;
+          } catch (_error) {
+            return "";
+          }
+        })(),
+        poster: null,
+        candidates: [],
+        useYtDlp: true
+      },
+      tab
+    );
+    renderVideoPanel(fallbackVideo);
+    setStatus("This site is being handed to NebulaDM through the page URL so the bundled extractor can try the download.");
   } else {
-    setStatus("No active HTML5 video detected in this tab.");
+    setStatus("No video was detected in this tab yet. Start playback first, then reopen the popup.");
   }
 }
 
@@ -125,6 +341,15 @@ saveButton.addEventListener("click", async () => {
   });
 
   setStatus(response.ok ? "Saved" : `Save failed: ${response.error}`);
+});
+
+enableCookiesButton.addEventListener("click", async () => {
+  setStatus("Requesting cookie access...");
+  const response = await chrome.runtime.sendMessage({ type: "nebula:enable-cookies" });
+  if (response.ok) {
+    sendCookiesInput.checked = true;
+  }
+  setStatus(response.ok ? response.message : `Cookie access failed: ${response.error}`);
 });
 
 downloadVideoButton.addEventListener("click", async () => {
@@ -185,7 +410,7 @@ captureEnabledInput.addEventListener("change", () => {
 
 sendCookiesInput.addEventListener("change", () => {
   if (sendCookiesInput.checked) {
-    setStatus("Saving with cookies enabled will trigger a browser permission prompt.");
+    setStatus("Save, or use Enable YouTube Cookies, to grant cookie access.");
     return;
   }
 

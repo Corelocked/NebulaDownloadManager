@@ -5,7 +5,7 @@
 - Introduces a polished Windows desktop download manager UI with separate direct and torrent workspaces.
 - Adds tray-first behavior, startup-in-background support, and a browser-capture confirmation flow with per-download save location selection.
 - Ships a privacy-first foundation with Privacy Mode, reduced browser metadata retention, and safer torrent defaults.
-- Tightens the browser video overlay, clarifies the capture actions, and improves desktop scrolling and browser-capture filename handling.
+- Moves browser video capture into the extension popup, improves YouTube handoff handling, and improves desktop scrolling and browser-capture filename handling.
 
 ## Included in this release
 
@@ -15,9 +15,10 @@
 - Native Windows toast notifications for download events.
 - Real Windows installer packaging through Inno Setup.
 - Public release assets for both installer and portable zip distribution.
-- Smaller in-page video capture UI with clearer `Download` and `Queue Only` actions.
+- Popup-first browser video capture with clearer `Download Video` and `Queue Only` actions.
 - Cleaner browser-capture confirmation windows with compact metadata display.
 - Fixed browser-captured video jobs that previously failed from invalid long YouTube-style filenames.
+- Bundled `ffmpeg` and `yt-dlp` support for smoother YouTube downloads without separate tool installs.
 - Main desktop content now scrolls when the page grows taller than the window.
 - Fixed restoring the desktop app from the Windows system tray.
 
@@ -36,7 +37,7 @@
 ## Notes
 
 - The browser extension is currently distributed as unpacked for Chrome/Edge.
-- Reload the unpacked browser extension after updating if you want the refreshed overlay labels and sizing.
-- Restart the desktop app after updating so the browser-capture filename fix, tray restore fix, and scrollable main view take effect.
+- Reload the unpacked browser extension after updating so the popup-only capture flow and YouTube handoff changes take effect.
+- Restart the desktop app after updating so the tray restore fix, popup capture behavior, and bundled media-tool support take effect.
 - Windows may still show SmartScreen warnings for unsigned builds.
 - The updater expects a hosted manifest that points to the uploaded GitHub Release installer asset.

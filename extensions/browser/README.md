@@ -7,8 +7,7 @@ This folder contains a Chromium-compatible extension that captures downloads and
 - Listens to browser download attempts
 - Sends the download metadata to `http://127.0.0.1:35791`
 - Cancels the browser-managed download when the desktop app accepts the handoff
-- Renders a floating action card over detected HTML5 videos with both download and non-destructive queue actions
-- Detects the active tab's HTML5 video in the popup and offers the same actions there
+- Detects the active tab's HTML5 video in the popup and offers download and non-destructive queue actions there
 - Falls back to normal browser behavior if the desktop bridge is unavailable
 - Tries to take over downloads as early as possible so NebulaDM becomes the effective download manager while the desktop app is running
 - Uses privacy-first defaults: only the file name, source URL, and inferred kind are forwarded unless the user explicitly enables extra browser metadata
@@ -42,7 +41,7 @@ The extension posts JSON like this to the desktop app:
 - Enabling cookie forwarding triggers an extra browser permission prompt because it needs access to site cookies and origins.
 - Authenticated downloads may need those opt-in settings if a site refuses plain URL downloads.
 - Keep `captureEnabled` turned on in the popup if you want the browser to hand downloads off to NebulaDM instead of the browser download manager.
-- When a page has an HTML5 video element, the extension shows both a floating in-page action card and popup actions for takeover download and non-destructive queueing.
-- YouTube-style blob playback is resolved on a best-effort basis by inspecting page data and recent media requests, but protected streams can still fail.
+- Video capture is popup-only. Open the extension on the active tab to send a detected video to NebulaDM.
+- YouTube pages are routed through bundled `yt-dlp` in the desktop app instead of relying on fragile direct `googlevideo` URLs.
 - The bridge URL can be changed from the popup if you move the desktop listener.
 - Icons are not wired yet, so the unpacked extension can load without image assets first.

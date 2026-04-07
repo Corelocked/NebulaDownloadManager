@@ -25,8 +25,20 @@ pub struct DownloadRequest {
     pub kind: DownloadKind,
     pub custom_target_folder: Option<String>,
     pub referrer: Option<String>,
+    #[serde(default)]
+    pub origin: Option<String>,
     pub user_agent: Option<String>,
     pub cookie_header: Option<String>,
+    #[serde(default)]
+    pub secondary_source: Option<String>,
+    #[serde(default)]
+    pub source_mime_type: Option<String>,
+    #[serde(default)]
+    pub secondary_source_mime_type: Option<String>,
+    #[serde(default)]
+    pub capture_diagnostics: Vec<String>,
+    #[serde(default)]
+    pub use_yt_dlp: bool,
 }
 
 impl DownloadRequest {
@@ -37,25 +49,56 @@ impl DownloadRequest {
             kind,
             custom_target_folder: None,
             referrer: None,
+            origin: None,
             user_agent: None,
             cookie_header: None,
+            secondary_source: None,
+            source_mime_type: None,
+            secondary_source_mime_type: None,
+            capture_diagnostics: Vec::new(),
+            use_yt_dlp: false,
         }
     }
 
     pub fn with_browser_context(
         mut self,
         referrer: Option<String>,
+        origin: Option<String>,
         user_agent: Option<String>,
         cookie_header: Option<String>,
     ) -> Self {
         self.referrer = referrer;
+        self.origin = origin;
         self.user_agent = user_agent;
         self.cookie_header = cookie_header;
         self
     }
 
+    pub fn with_secondary_source(
+        mut self,
+        secondary_source: Option<String>,
+        source_mime_type: Option<String>,
+        secondary_source_mime_type: Option<String>,
+    ) -> Self {
+        self.secondary_source = secondary_source;
+        self.source_mime_type = source_mime_type;
+        self.secondary_source_mime_type = secondary_source_mime_type;
+        self
+    }
+
+    pub fn with_capture_diagnostics(mut self, capture_diagnostics: Vec<String>) -> Self {
+        self.capture_diagnostics = capture_diagnostics;
+        self
+    }
+
+    pub fn with_yt_dlp(mut self, use_yt_dlp: bool) -> Self {
+        self.use_yt_dlp = use_yt_dlp;
+        self
+    }
+
     pub fn clear_browser_context(&mut self) {
         self.referrer = None;
+        self.origin = None;
         self.user_agent = None;
         self.cookie_header = None;
     }
@@ -232,18 +275,41 @@ pub struct BrowserCapturePayload {
     pub file_name: String,
     pub source: String,
     pub kind: DownloadKind,
+    #[serde(default)]
+    pub auto_start: bool,
     pub referrer: Option<String>,
+    #[serde(default)]
+    pub origin: Option<String>,
     pub user_agent: Option<String>,
     pub cookie_header: Option<String>,
+    #[serde(default)]
+    pub secondary_source: Option<String>,
+    #[serde(default)]
+    pub source_mime_type: Option<String>,
+    #[serde(default)]
+    pub secondary_source_mime_type: Option<String>,
+    #[serde(default)]
+    pub capture_diagnostics: Vec<String>,
+    #[serde(default)]
+    pub use_yt_dlp: bool,
 }
 
 impl BrowserCapturePayload {
     pub fn into_request(self) -> DownloadRequest {
-        DownloadRequest::new(self.file_name, self.source, self.kind).with_browser_context(
-            self.referrer,
-            self.user_agent,
-            self.cookie_header,
-        )
+        DownloadRequest::new(self.file_name, self.source, self.kind)
+            .with_browser_context(
+                self.referrer,
+                self.origin,
+                self.user_agent,
+                self.cookie_header,
+            )
+            .with_secondary_source(
+                self.secondary_source,
+                self.source_mime_type,
+                self.secondary_source_mime_type,
+            )
+            .with_capture_diagnostics(self.capture_diagnostics)
+            .with_yt_dlp(self.use_yt_dlp)
     }
 }
 

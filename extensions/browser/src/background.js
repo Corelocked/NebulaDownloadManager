@@ -11,6 +11,18 @@ const VIDEO_EXTENSIONS = [".mp4", ".m4v", ".webm", ".mov", ".mkv", ".avi"];
 const mediaRequestsByTab = new Map();
 const MEDIA_REQUEST_MAX_AGE_MS = 3 * 60 * 1000;
 const MEDIA_REQUEST_LIMIT = 24;
+const YT_DLP_SITE_PATTERNS = [
+  /(^|\.)youtube\.com$/i,
+  /(^|\.)youtu\.be$/i,
+  /(^|\.)facebook\.com$/i,
+  /(^|\.)fb\.watch$/i,
+  /(^|\.)instagram\.com$/i,
+  /(^|\.)tiktok\.com$/i,
+  /(^|\.)twitter\.com$/i,
+  /(^|\.)x\.com$/i,
+  /(^|\.)vimeo\.com$/i,
+  /(^|\.)dailymotion\.com$/i
+];
 
 async function getSettings() {
   const stored = await chrome.storage.local.get(DEFAULT_SETTINGS);
@@ -45,6 +57,18 @@ async function ensureCookiePermissions() {
   return granted;
 }
 
+async function canAccessCookies() {
+  try {
+    return await chrome.permissions.contains({
+      permissions: ["cookies"],
+      origins: ["<all_urls>"]
+    });
+  } catch (error) {
+    console.warn("NebulaDM cookie permission check failed", error);
+    return false;
+  }
+}
+
 function inferKind(filename, url) {
   const lowerName = (filename || "").toLowerCase();
   const lowerUrl = (url || "").toLowerCase();
@@ -55,10 +79,14 @@ function inferKind(filename, url) {
 }
 
 function inferVideoFileName(video) {
+  const normalizedTitle = String(video?.title || "")
+    .replace(/\s+-\s+YouTube$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
   const candidates = [
     video?.downloadName,
     video?.fileName,
-    video?.title,
+    normalizedTitle,
     video?.url ? video.url.split("/").pop()?.split("?")[0] : null
   ];
 
@@ -76,7 +104,7 @@ function inferVideoFileName(video) {
     }
   }
 
-  const sanitizedTitle = (video?.title || "video")
+  const sanitizedTitle = (normalizedTitle || "video")
     .replace(/[<>:"/\\|?*\u0000-\u001f]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -97,6 +125,12 @@ function isLikelyYouTubeVideo(video, tabUrl) {
     /youtube\.com/i.test(tab) ||
     /googlevideo\.com/i.test(sourceUrl)
   );
+}
+
+function shouldPreferYtDlp(video, tabUrl) {
+  const pageHost = String(video?.pageHost || "");
+  const pageUrl = String(tabUrl || video?.pageUrl || video?.url || "");
+  return YT_DLP_SITE_PATTERNS.some((pattern) => pattern.test(pageHost) || pattern.test(pageUrl));
 }
 
 function rememberMediaRequest(details) {
@@ -166,6 +200,8 @@ function scoreVideoCandidate(candidate, tabUrl) {
     score += 140;
   } else if (kind === "youtube-adaptive-video") {
     score -= 120;
+  } else if (kind === "youtube-adaptive-audio") {
+    score -= 400;
   } else if (kind === "video-element") {
     score += 30;
   } else if (kind === "network-observed") {
@@ -232,16 +268,26 @@ function pickBestVideoCandidate(video, tabId, tabUrl) {
   if (isLikelyYouTubeVideo(video, tabUrl)) {
     const muxedCandidate = ranked.find((candidate) => candidate.kind === "youtube-muxed");
     if (muxedCandidate) {
-      return muxedCandidate;
+      return { primary: muxedCandidate, secondary: null };
+    }
+
+    const adaptiveVideoCandidate = ranked.find(
+      (candidate) => candidate.kind === "youtube-adaptive-video" && candidate.score > -200
+    );
+    const adaptiveAudioCandidate = ranked.find(
+      (candidate) => candidate.kind === "youtube-adaptive-audio"
+    );
+    if (adaptiveVideoCandidate && adaptiveAudioCandidate) {
+      return { primary: adaptiveVideoCandidate, secondary: adaptiveAudioCandidate };
     }
 
     const safeCandidate = ranked.find(
       (candidate) => candidate.hasAudio !== false && candidate.score > 0
     );
-    return safeCandidate || null;
+    return safeCandidate ? { primary: safeCandidate, secondary: null } : null;
   }
 
-  return ranked[0];
+  return { primary: ranked[0], secondary: null };
 }
 
 function inferFileName(item) {
@@ -252,11 +298,14 @@ function inferFileName(item) {
 
 async function buildPayload(item, settings) {
   const source = item.finalUrl || item.url;
+  const referrer = settings.sendReferrer ? item.referrer || null : null;
+  const origin = referrer ? new URL(referrer).origin : null;
   return {
     file_name: inferFileName(item),
     source,
     kind: inferKind(item.filename, item.url),
-    referrer: settings.sendReferrer ? item.referrer || null : null,
+    referrer,
+    origin,
     user_agent: settings.sendUserAgent ? navigator.userAgent : null,
     cookie_header:
       settings.sendCookies && source.startsWith("http") ? await getCookieHeader(source) : null
@@ -331,8 +380,20 @@ async function postCapture(payload) {
 }
 
 async function resolveVideoDownload(video, tabId, tabUrl) {
+  if (video?.useYtDlp) {
+    return {
+      file_name: inferVideoFileName(video),
+      source: tabUrl || video.pageUrl || video.url,
+      secondary_source: null,
+      source_mime_type: "application/x-nebula-ytdlp",
+      secondary_source_mime_type: "",
+      referrer: tabUrl || video.pageUrl || null,
+      use_yt_dlp: true
+    };
+  }
+
   const bestCandidate = pickBestVideoCandidate(video, tabId, tabUrl);
-  if (!bestCandidate) {
+  if (!bestCandidate?.primary) {
     throw new Error(
       "No downloadable video source was found. This page may be using protected or browser-only streaming."
     );
@@ -340,36 +401,107 @@ async function resolveVideoDownload(video, tabId, tabUrl) {
 
   return {
     file_name: inferVideoFileName(video),
-    source: bestCandidate.url,
-    referrer: tabUrl || video.pageUrl || null
+    source: bestCandidate.primary.url,
+    secondary_source: bestCandidate.secondary?.url || null,
+    source_mime_type: bestCandidate.primary.mimeType || "",
+    secondary_source_mime_type: bestCandidate.secondary?.mimeType || "",
+    referrer: tabUrl || video.pageUrl || null,
+    use_yt_dlp: false
   };
 }
 
 async function captureVideoFromTab(video, tabId, tabUrl) {
+  const autoStart = video?.autoStart === true;
   const settings = await getSettings();
   const resolved = await resolveVideoDownload(video, tabId, tabUrl);
   const sourceUrl = resolved.source || "";
   const requiresBrowserContext =
-    /googlevideo\.com/i.test(sourceUrl) || /videoplayback/i.test(sourceUrl);
+    !resolved.use_yt_dlp &&
+    (/googlevideo\.com/i.test(sourceUrl) || /videoplayback/i.test(sourceUrl));
+  let cookieHeader = null;
+
+  if (resolved.source.startsWith("http") && (settings.sendCookies || requiresBrowserContext)) {
+    let canReadCookies = settings.sendCookies;
+    if (!canReadCookies && requiresBrowserContext) {
+      canReadCookies = await canAccessCookies();
+      if (!canReadCookies) {
+        canReadCookies = await ensureCookiePermissions();
+      }
+    }
+
+    if (canReadCookies) {
+      cookieHeader = await getCookieHeader(resolved.source);
+    }
+  }
+
+  const captureDiagnostics = [
+    `pageHost=${video?.pageHost || ""}`,
+    `tabUrl=${tabUrl || ""}`,
+    `sourceHost=${(() => { try { return new URL(resolved.source).host; } catch (_error) { return ""; } })()}`,
+    `requiresBrowserContext=${String(requiresBrowserContext)}`,
+    `autoStart=${String(autoStart)}`,
+    `hasReferrer=${String(Boolean(resolved.referrer))}`,
+    `hasOrigin=${String(Boolean(resolved.referrer))}`,
+    `hasUserAgent=${String(Boolean(settings.sendUserAgent || requiresBrowserContext))}`,
+    `hasCookies=${String(Boolean(cookieHeader))}`,
+    `cookieCount=${cookieHeader ? cookieHeader.split(";").filter(Boolean).length : 0}`,
+    `primaryMime=${resolved.source_mime_type || ""}`,
+    `secondarySource=${String(Boolean(resolved.secondary_source))}`,
+    `secondaryMime=${resolved.secondary_source_mime_type || ""}`,
+    `candidateCount=${Array.isArray(video?.candidates) ? video.candidates.length : 0}`
+  ];
+
   const payload = {
     file_name: resolved.file_name,
     source: resolved.source,
     kind: "Direct",
+    auto_start: autoStart,
+    origin: resolved.referrer ? new URL(resolved.referrer).origin : null,
     referrer:
       settings.sendReferrer || requiresBrowserContext ? resolved.referrer : null,
     user_agent:
       settings.sendUserAgent || requiresBrowserContext ? navigator.userAgent : null,
-    cookie_header:
-      settings.sendCookies && resolved.source.startsWith("http")
-        ? await getCookieHeader(resolved.source)
-        : null
+    cookie_header: cookieHeader,
+    secondary_source: resolved.secondary_source,
+    source_mime_type: resolved.source_mime_type || null,
+    secondary_source_mime_type: resolved.secondary_source_mime_type || null,
+    capture_diagnostics: captureDiagnostics,
+    use_yt_dlp: resolved.use_yt_dlp === true
   };
 
   return postCapture(payload);
 }
 
+async function prepareVideoCapturePermissions(video, tabUrl) {
+  if (!isLikelyYouTubeVideo(video, tabUrl)) {
+    return { ok: true };
+  }
+
+  if (video?.useYtDlp) {
+    return { ok: true };
+  }
+
+  const settings = await getSettings();
+  if (settings.sendCookies) {
+    return { ok: true };
+  }
+
+  const hasCookiesAlready = await canAccessCookies();
+  if (hasCookiesAlready) {
+    return { ok: true };
+  }
+  return {
+    ok: false,
+    error: "Cookie access is required for YouTube capture. Open the extension popup and enable cookies first."
+  };
+}
+
 async function triggerBrowserVideoDownload(video, tabId, tabUrl) {
   const resolved = await resolveVideoDownload(video, tabId, tabUrl);
+  if (isLikelyYouTubeVideo(video, tabUrl) || /googlevideo\.com|videoplayback/i.test(resolved.source)) {
+    return captureVideoFromTab(video, tabId, tabUrl);
+  }
+
   return chrome.downloads.download({
     url: resolved.source,
     filename: resolved.file_name,
@@ -434,6 +566,15 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "nebula:get-media-candidates") {
+    const tabId = Number(message.tabId ?? sender.tab?.id ?? -1);
+    const candidates = (mediaRequestsByTab.get(tabId) || [])
+      .filter((candidate) => Date.now() - candidate.timeStamp <= MEDIA_REQUEST_MAX_AGE_MS)
+      .slice(0, 8);
+    sendResponse({ ok: true, candidates });
+    return true;
+  }
+
   if (message?.type === "nebula:get-settings") {
     getSettings().then(sendResponse);
     return true;
@@ -467,9 +608,46 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === "nebula:enable-cookies") {
+    ensureCookiePermissions()
+      .then((granted) => {
+        if (!granted) {
+          sendResponse({
+            ok: false,
+            error: "Cookie access was not granted."
+          });
+          return;
+        }
+
+        return chrome.storage.local
+          .set({ sendCookies: true })
+          .then(() => sendResponse({ ok: true, message: "Cookie access enabled for NebulaDM." }));
+      })
+      .catch((error) => sendResponse({ ok: false, error: String(error) }));
+    return true;
+  }
+
   if (message?.type === "nebula:capture-video") {
-    captureVideoFromTab(message.video, message.tabId ?? sender.tab?.id ?? -1, message.tabUrl)
+    const video = shouldPreferYtDlp(message.video, message.tabUrl)
+      ? { ...(message.video || {}), useYtDlp: true }
+      : message.video;
+    prepareVideoCapturePermissions(message.video, message.tabUrl)
+      .then((permissionResult) => {
+        if (!permissionResult.ok) {
+          sendResponse(permissionResult);
+          return null;
+        }
+
+        return captureVideoFromTab(
+          video,
+          message.tabId ?? sender.tab?.id ?? -1,
+          message.tabUrl
+        );
+      })
       .then((result) => {
+        if (!result) {
+          return;
+        }
         if (!result.ok) {
           sendResponse({
             ok: false,
@@ -483,7 +661,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
         sendResponse({
           ok: true,
-          message: `Queued ${inferVideoFileName(message.video)} in NebulaDM without interrupting playback.`
+          message: `Queued ${inferVideoFileName(video)} in NebulaDM without interrupting playback.`
         });
       })
       .catch((error) => sendResponse({ ok: false, error: String(error) }));
@@ -491,17 +669,53 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === "nebula:download-video") {
-    triggerBrowserVideoDownload(
-      message.video,
-      message.tabId ?? sender.tab?.id ?? -1,
-      message.tabUrl
-    )
-      .then(() =>
+    const video = {
+      ...(message.video || {}),
+      useYtDlp: shouldPreferYtDlp(message.video, message.tabUrl)
+        ? true
+        : Boolean(message.video?.useYtDlp),
+      autoStart: true
+    };
+    prepareVideoCapturePermissions(video, message.tabUrl)
+      .then((permissionResult) => {
+        if (!permissionResult.ok) {
+          sendResponse(permissionResult);
+          return null;
+        }
+
+        return triggerBrowserVideoDownload(
+          video,
+          message.tabId ?? sender.tab?.id ?? -1,
+          message.tabUrl
+        );
+      })
+      .then((result) => {
+        if (!result) {
+          return;
+        }
+        if (result?.ok === false) {
+          sendResponse({
+            ok: false,
+            error:
+              result.reason === "capture disabled"
+                ? "Browser capture is disabled in the extension settings."
+                : "NebulaDM could not start this video download."
+          });
+          return;
+        }
+
+        const sourceUrl = String(message.video?.url || "");
+        const usedDirectBridge =
+          Boolean(result?.ok) ||
+          isLikelyYouTubeVideo(video, message.tabUrl) ||
+          /googlevideo\.com|videoplayback/i.test(sourceUrl);
         sendResponse({
           ok: true,
-          message: `Started browser handoff for ${inferVideoFileName(message.video)}.`
-        })
-      )
+          message: usedDirectBridge
+            ? `Sent ${inferVideoFileName(video)} straight to NebulaDM.`
+            : `Started browser handoff for ${inferVideoFileName(video)}.`
+        });
+      })
       .catch((error) => sendResponse({ ok: false, error: String(error) }));
     return true;
   }
