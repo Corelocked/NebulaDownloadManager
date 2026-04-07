@@ -5,10 +5,12 @@
 
 # Packaged app output
 /dist/
+/setup/*.exe
 
 # Local app state and downloaded test data
 /data/
 /Downloads/
+/tools/yt-dlp/tmp/
 
 # Rust formatter backups
 **/*.rs.bk
@@ -24,3 +26,8 @@
 # OS files
 .DS_Store
 Thumbs.db
+
+# Accidental extra Cargo target dirs
+/target*/
+!/target/
+!/target-*/

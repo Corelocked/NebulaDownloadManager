@@ -32,7 +32,7 @@
 1. Download NebulaDM-Setup.exe from this release.
 2. Run the installer and complete setup.
 3. Launch NebulaDM.
-4. Load the unpacked browser extension from the bundled browser-extension folder if you want browser handoff.
+4. Load the unpacked browser extension from the bundled `browser-extension` folder if you want browser handoff.
 
 ## Notes
 
@@ -41,3 +41,4 @@
 - Restart the desktop app after updating so the tray restore fix, popup capture behavior, and bundled media-tool support take effect.
 - Windows may still show SmartScreen warnings for unsigned builds.
 - The updater expects a hosted manifest that points to the uploaded GitHub Release installer asset.
+
