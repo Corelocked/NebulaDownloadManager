@@ -1,4 +1,4 @@
-# NebulaDM v0.1.2
+# NebulaDM v0.1.3
 
 ## Highlights
 
@@ -25,7 +25,7 @@
 ## Downloads
 
 - Installer: NebulaDM-Setup.exe
-- Portable build: NebulaDM-win64-default-v0.1.2.zip
+- Portable build: NebulaDM-win64-default-v0.1.3.zip
 
 ## Install / Update
 
